@@ -138,21 +138,23 @@ class Refiner(nn.Module):
 
         steps = self.T if T_run is None else min(int(T_run), self.T)
 
-        for t in range(steps):
-            u = u.requires_grad_(True)
-            theta, r = map_u_to_theta_r(u, self.box)
-            a = steering_vector_torch(theta, r, self.cfg, dtype=z.dtype)
-            J = normalized_correlation_torch(a, z)  # (B,)
+        # 在 forward() 里，steps = ... 之后加：
+        with torch.enable_grad():
+            for t in range(steps):
+                u = u.requires_grad_(True)
+                theta, r = map_u_to_theta_r(u, self.box)
+                a = steering_vector_torch(theta, r, self.cfg, dtype=z.dtype)
+                J = normalized_correlation_torch(a, z)  # (B,)
 
-            g = torch.autograd.grad(
-                (-J).sum(), u, create_graph=self.training, retain_graph=self.training
-            )[0]
-            u = u - alpha[t] * g / (torch.abs(g) + lambd[t])
+                g = torch.autograd.grad(
+                    (-J).sum(), u, create_graph=self.training, retain_graph=self.training
+                )[0]
+                u = u - alpha[t] * g / (torch.abs(g) + lambd[t])
 
-            if return_trace:
-                Js.append(J.detach())
-                thetas.append(theta.detach())
-                rs.append(r.detach())
+                if return_trace:
+                    Js.append(J.detach())
+                    thetas.append(theta.detach())
+                    rs.append(r.detach())
 
         theta_T, r_T = map_u_to_theta_r(u, self.box)
         aT = steering_vector_torch(theta_T, r_T, self.cfg, dtype=z.dtype)
