@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snr_list", type=str, default="-15,-10,-5,0,5,10,15,20")
     p.add_argument("--num_samples", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--T", type=int, default=10)
+    p.add_argument("--T", type=int, default=None)
     p.add_argument("--theta_step", type=float, default=1.0)
     p.add_argument("--r_step", type=float, default=100.0)
     p.add_argument("--nm_maxiter", type=int, default=60)
@@ -57,31 +57,30 @@ def _nonfinite_module_tensors(module: torch.nn.Module) -> list[str]:
 
 def _sanitize_refiner_alpha_lambda(refiner: Refiner, *, init_alpha: float = 2e-2, init_lambda: float = 1e-3) -> None:
     """
-    Best-effort sanitize for corrupted checkpoints where alpha_raw/lambda_raw become NaN/Inf.
+    Best-effort sanitize for corrupted checkpoints where step parameters become NaN/Inf.
     """
 
     with torch.no_grad():
-        device = refiner.alpha_raw.device
-        dtype = refiner.alpha_raw.dtype
+        device = refiner.alpha_theta_raw.device
+        dtype = refiner.alpha_theta_raw.dtype
 
-        def logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-            p = p.clamp(eps, 1.0 - eps)
-            return torch.log(p) - torch.log1p(-p)
+        def inv_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+            x = x.clamp_min(eps)
+            return torch.log(torch.expm1(x))
 
-        alpha0 = torch.full((refiner.T,), float(init_alpha), device=device, dtype=dtype)
-        lambda0 = torch.full((refiner.T,), float(init_lambda), device=device, dtype=dtype)
+        a0 = torch.full((refiner.T,), float(init_alpha), device=device, dtype=dtype)
+        l0 = torch.full((refiner.T,), float(init_lambda), device=device, dtype=dtype)
+        a_raw0 = inv_softplus(a0)
+        l_raw0 = inv_softplus(l0)
 
-        a_p = (alpha0 - float(refiner.alpha_min)) / (float(refiner.alpha_max) - float(refiner.alpha_min))
-        l_p = (lambda0 - float(refiner.lambda_min)) / (float(refiner.lambda_max) - float(refiner.lambda_min))
-        alpha_raw0 = logit(a_p)
-        lambda_raw0 = logit(l_p)
-
-        refiner.alpha_raw.data = torch.where(
-            torch.isfinite(refiner.alpha_raw.data), refiner.alpha_raw.data, alpha_raw0
-        )
-        refiner.lambda_raw.data = torch.where(
-            torch.isfinite(refiner.lambda_raw.data), refiner.lambda_raw.data, lambda_raw0
-        )
+        for name, raw0 in [
+            ("alpha_theta_raw", a_raw0),
+            ("alpha_r_raw", a_raw0),
+            ("lambda_theta_raw", l_raw0),
+            ("lambda_r_raw", l_raw0),
+        ]:
+            t = getattr(refiner, name)
+            t.data = torch.where(torch.isfinite(t.data), t.data, raw0)
 
 
 def run_unrolled(
@@ -164,9 +163,21 @@ def main() -> None:
     cfg = FDAConfig()
     box = TargetBox()
 
+    # Resolve T to avoid checkpoint shape mismatch.
+    ckpt_T = None
+    if args.ckpt_path and args.T is None:
+        try:
+            ckpt_meta = torch.load(args.ckpt_path, map_location="cpu")
+            ckpt_T = ckpt_meta.get("T", None)
+            if ckpt_T is None:
+                ckpt_T = ckpt_meta.get("args", {}).get("T", None)
+        except Exception:
+            ckpt_T = None
+    T_resolved = int(args.T) if args.T is not None else int(ckpt_T) if ckpt_T is not None else 10
+
     run_dir = Path(args.run_dir) if args.run_dir else Path("runs") / f"eval_{timestamp()}"
     ensure_dir(run_dir)
-    write_json(run_dir / "config.json", {**vars(args), "cfg": cfg.__dict__})
+    write_json(run_dir / "config.json", {**vars(args), "T_resolved": T_resolved, "cfg": cfg.__dict__})
 
     ensure_dir("runs")
     latest = Path("runs") / "latest_eval"
@@ -277,7 +288,7 @@ def main() -> None:
             device=device,
             theta_step=args.theta_step,
             r_step=args.r_step,
-            T=args.T,
+            T=T_resolved,
             ckpt_path="",
             sanitize_ckpt=False,
             learnable=False,
@@ -306,7 +317,7 @@ def main() -> None:
                     device=device,
                     theta_step=args.theta_step,
                     r_step=args.r_step,
-                    T=args.T,
+                    T=T_resolved,
                     ckpt_path=args.ckpt_path,
                     sanitize_ckpt=bool(args.sanitize_ckpt),
                     learnable=True,
@@ -387,7 +398,7 @@ def main() -> None:
         )
         refiner = Refiner(
             cfg,
-            T=args.T,
+            T=T_resolved,
             box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
             learnable=learned,
         ).to(device)
@@ -426,7 +437,7 @@ def main() -> None:
         return th_hat, r_hat, ms_per_sample(dt, ab_n)
 
     for T_run in ablate_T:
-        if T_run > args.T:
+        if T_run > T_resolved:
             continue
         th_hat, r_hat, ms_hat = run_unrolled_with_Trun(False, "", T_run)
         ab_csv.log(
@@ -553,7 +564,7 @@ def main() -> None:
                 device=device,
                 theta_step=th_step,
                 r_step=rr_step,
-                T=args.T,
+                T=T_resolved,
                 ckpt_path="",
                 sanitize_ckpt=False,
                 learnable=False,
@@ -581,7 +592,7 @@ def main() -> None:
                         device=device,
                         theta_step=th_step,
                         r_step=rr_step,
-                        T=args.T,
+                        T=T_resolved,
                         ckpt_path=args.ckpt_path,
                         sanitize_ckpt=bool(args.sanitize_ckpt),
                         learnable=True,

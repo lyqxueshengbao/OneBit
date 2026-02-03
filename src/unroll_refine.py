@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 from torch import nn
 
 from .fda import FDAConfig, steering_vector_torch
-from .objective import normalized_correlation_torch
+from .objective import loglike_logistic, loglike_probit, normalized_correlation_torch
 
 
 def _inv_sigmoid(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -20,6 +20,15 @@ def _inv_tanh(y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return 0.5 * (torch.log1p(y) - torch.log1p(-y))
 
 
+def _inv_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Numerically-stable inverse-softplus for initialization (x must be positive).
+    """
+
+    x = x.clamp_min(eps)
+    return torch.log(torch.expm1(x))
+
+
 @dataclass(frozen=True)
 class Box:
     theta_min: float = -60.0
@@ -30,16 +39,15 @@ class Box:
 
 def map_u_to_theta_r(u: torch.Tensor, box: Box) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Map unconstrained u -> (theta,r) within the valid box via sigmoid.
+    Map unconstrained u -> (theta,r) within the valid box.
 
     Args:
-      u: (B,2) (u_theta, u_r)
+      u: (B,2) where u[:,0] for theta, u[:,1] for r
     Returns:
-      theta_deg: (B,)
-      r_m: (B,)
+      theta_deg: (B,) deg
+      r_m: (B,) m
     """
 
-    # theta: tanh map (symmetric); r: sigmoid map.
     theta_mid = 0.5 * (box.theta_min + box.theta_max)
     theta_half = 0.5 * (box.theta_max - box.theta_min)
     theta = theta_mid + theta_half * torch.tanh(u[:, 0])
@@ -50,7 +58,7 @@ def map_u_to_theta_r(u: torch.Tensor, box: Box) -> Tuple[torch.Tensor, torch.Ten
 
 def map_theta_r_to_u(theta_deg: torch.Tensor, r_m: torch.Tensor, box: Box) -> torch.Tensor:
     """
-    Inverse map (theta,r) -> u via logit.
+    Inverse map (theta,r) -> u via (atanh/logit).
     """
 
     theta_mid = 0.5 * (box.theta_min + box.theta_max)
@@ -63,16 +71,20 @@ def map_theta_r_to_u(theta_deg: torch.Tensor, r_m: torch.Tensor, box: Box) -> to
 
 class Refiner(nn.Module):
     """
-    Unrolled off-grid refinement module under the same objective J(theta,r).
+    Unrolled off-grid refinement with boundary constraints.
 
-    Update rule (per step t):
-      u <- u - alpha_t * g / (|g| + lambda_t)
-    where g = ∂(-J)/∂u from autograd.
+    Objective:
+      Maximize 1-bit likelihood (default logistic), or use baseline J for ablation.
 
-    Notes on stability:
-      By default this module uses a *first-order* unroll (second_order=False), i.e. we do NOT
-      backprop through the gradient operator itself. This dramatically improves stability and
-      prevents alpha_raw/lambda_raw from being corrupted by exploding higher-order graphs.
+    Update (simple diagonal LM-like):
+      g = ∂(-obj)/∂u
+      du_theta = alpha_theta[t] * g_theta / (|g_theta| + lambda_theta[t])
+      du_r     = alpha_r[t]     * g_r     / (|g_r|     + lambda_r[t])
+      u <- u - clamp([du_theta, du_r], [-step_clip, step_clip])
+
+    Stability:
+      Default is *first-order unroll* (second_order=False), i.e. do NOT backprop through the
+      gradient operator itself (no higher-order graph). This is far more stable.
     """
 
     def __init__(
@@ -82,53 +94,64 @@ class Refiner(nn.Module):
         T: int = 10,
         box: Box = Box(),
         learnable: bool = True,
-        init_alpha: float = 2e-2,
+        objective: str = "logistic",  # {"logistic","probit","J"}
+        init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
-        alpha_min: float = 1e-5,
-        alpha_max: float = 5e-2,
-        lambda_min: float = 1e-3,
+        alpha_min: float = 1e-6,
+        alpha_max: float = 2e-1,
+        lambda_min: float = 1e-6,
         lambda_max: float = 1.0,
-        step_clip: float = 0.25,
-        eps: float = 1e-8,
+        step_clip: float = 1e-1,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self.T = int(T)
         self.box = box
-        self.eps = float(eps)
+        self.objective = str(objective)
+
+        self.init_alpha = float(init_alpha)
+        self.init_lambda = float(init_lambda)
         self.alpha_min = float(alpha_min)
         self.alpha_max = float(alpha_max)
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
         self.step_clip = float(step_clip)
 
-        # Bounded parameterization via sigmoid:
-        #   alpha = a_min + (a_max-a_min) * sigmoid(alpha_raw)
-        #   lambda = l_min + (l_max-l_min) * sigmoid(lambda_raw)
-        #
-        # We initialize raw values by inverse-sigmoid on the normalized interval.
         a0 = torch.full((self.T,), float(init_alpha), dtype=torch.float32)
         l0 = torch.full((self.T,), float(init_lambda), dtype=torch.float32)
-
-        a_p = (a0 - self.alpha_min) / (self.alpha_max - self.alpha_min)
-        l_p = (l0 - self.lambda_min) / (self.lambda_max - self.lambda_min)
-        alpha_raw = _inv_sigmoid(a_p)
-        lambda_raw = _inv_sigmoid(l_p)
+        a_raw0 = _inv_softplus(a0)
+        l_raw0 = _inv_softplus(l0)
 
         if learnable:
-            self.alpha_raw = nn.Parameter(alpha_raw)
-            self.lambda_raw = nn.Parameter(lambda_raw)
+            self.alpha_theta_raw = nn.Parameter(a_raw0.clone())
+            self.alpha_r_raw = nn.Parameter(a_raw0.clone())
+            self.lambda_theta_raw = nn.Parameter(l_raw0.clone())
+            self.lambda_r_raw = nn.Parameter(l_raw0.clone())
         else:
-            self.register_buffer("alpha_raw", alpha_raw)
-            self.register_buffer("lambda_raw", lambda_raw)
+            self.register_buffer("alpha_theta_raw", a_raw0.clone())
+            self.register_buffer("alpha_r_raw", a_raw0.clone())
+            self.register_buffer("lambda_theta_raw", l_raw0.clone())
+            self.register_buffer("lambda_r_raw", l_raw0.clone())
 
-    def alpha(self) -> torch.Tensor:
-        s = torch.sigmoid(self.alpha_raw)
-        return self.alpha_min + (self.alpha_max - self.alpha_min) * s
+    def _alpha_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        a = torch.nn.functional.softplus(raw)
+        return a.clamp(self.alpha_min, self.alpha_max)
 
-    def lambd(self) -> torch.Tensor:
-        s = torch.sigmoid(self.lambda_raw)
-        return self.lambda_min + (self.lambda_max - self.lambda_min) * s
+    def _lambda_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        l = torch.nn.functional.softplus(raw)
+        return l.clamp(self.lambda_min, self.lambda_max)
+
+    def _objective_value(
+        self, theta_deg: torch.Tensor, r_m: torch.Tensor, z: torch.Tensor, beta: float | torch.Tensor
+    ) -> torch.Tensor:
+        if self.objective == "logistic":
+            return loglike_logistic(theta_deg, r_m, z, beta, self.cfg)
+        if self.objective == "probit":
+            return loglike_probit(theta_deg, r_m, z, beta, self.cfg)
+        if self.objective == "J":
+            a = steering_vector_torch(theta_deg, r_m, self.cfg, dtype=z.dtype)
+            return normalized_correlation_torch(a, z)
+        raise ValueError(f"Unknown objective: {self.objective}")
 
     def forward(
         self,
@@ -137,6 +160,7 @@ class Refiner(nn.Module):
         r0_m: torch.Tensor,
         *,
         T_run: int | None = None,
+        beta: float | torch.Tensor = 2.0,
         second_order: bool = False,
         sanitize_in_forward: bool = False,
         return_trace: bool = False,
@@ -144,94 +168,133 @@ class Refiner(nn.Module):
         """
         Args:
           z: (B,K) complex64
-          theta0_deg: (B,) deg (coarse init)
-          r0_m: (B,) m (coarse init)
+          theta0_deg: (B,) deg
+          r0_m: (B,) m
+          beta: likelihood sharpness
+          second_order: if True, build higher-order graph (slow/unstable; default False)
+          sanitize_in_forward: if True, use nan_to_num *views* of raw params for computation (no write-back)
+          return_trace: if True, return per-step traces (detached)
+
         Returns:
           theta_T: (B,) deg
           r_T: (B,) m
-          J_T: (B,) objective value at final step
-          trace (optional): dict of intermediate tensors (detached)
+          debug: dict with keys {"obj","ll_mean","alpha_mean","lambda_mean","objective","beta"}
+          trace (optional): dict with keys {"J","theta","r","nonfinite_g_ratio","fallback_alpha","fallback_lambda"}
         """
 
         u = map_theta_r_to_u(theta0_deg, r0_m, self.box)
 
-        # Optional non-inplace sanitization for forward computation only.
-        # By default we do NOT modify parameters or silently "fix" them.
-        raw_a = self.alpha_raw
-        raw_l = self.lambda_raw
+        raw_at = self.alpha_theta_raw
+        raw_ar = self.alpha_r_raw
+        raw_lt = self.lambda_theta_raw
+        raw_lr = self.lambda_r_raw
         if sanitize_in_forward:
-            raw_a = torch.nan_to_num(raw_a, nan=0.0, posinf=20.0, neginf=-20.0)
-            raw_l = torch.nan_to_num(raw_l, nan=0.0, posinf=20.0, neginf=-20.0)
+            raw_at = torch.nan_to_num(raw_at, nan=0.0, posinf=0.0, neginf=0.0)
+            raw_ar = torch.nan_to_num(raw_ar, nan=0.0, posinf=0.0, neginf=0.0)
+            raw_lt = torch.nan_to_num(raw_lt, nan=0.0, posinf=0.0, neginf=0.0)
+            raw_lr = torch.nan_to_num(raw_lr, nan=0.0, posinf=0.0, neginf=0.0)
 
-        alpha = (self.alpha_min + (self.alpha_max - self.alpha_min) * torch.sigmoid(raw_a)).to(
-            u.device
-        )
-        lambd = (self.lambda_min + (self.lambda_max - self.lambda_min) * torch.sigmoid(raw_l)).to(
-            u.device
-        )
+        alpha_theta = self._alpha_from_raw(raw_at).to(u.device)
+        alpha_r = self._alpha_from_raw(raw_ar).to(u.device)
+        lambda_theta = self._lambda_from_raw(raw_lt).to(u.device)
+        lambda_r = self._lambda_from_raw(raw_lr).to(u.device)
 
-        Js = []
-        thetas = []
-        rs = []
+        steps = self.T if T_run is None else min(int(T_run), self.T)
+
+        obj_trace = []
+        theta_trace = []
+        r_trace = []
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
 
-        steps = self.T if T_run is None else min(int(T_run), self.T)
-
-        # Always enable grad inside refinement so it works even if caller wraps `torch.no_grad()`.
         with torch.enable_grad():
             for t in range(steps):
                 u = u.requires_grad_(True)
                 theta, r = map_u_to_theta_r(u, self.box)
-                a = steering_vector_torch(theta, r, self.cfg, dtype=z.dtype)
-                J = normalized_correlation_torch(a, z)  # (B,)
+                obj = self._objective_value(theta, r, z, beta)  # (B,)
 
                 g = torch.autograd.grad(
-                    (-J).sum(),
+                    (-obj).sum(),
                     u,
                     create_graph=bool(second_order),
                     retain_graph=bool(second_order),
                 )[0]
 
-                alpha_t = alpha[t]
-                lambda_t = lambd[t]
-
-                # Fallback statistics (per-step scalar): whether raw params are non-finite.
-                raw_a_t = self.alpha_raw[t]
-                raw_l_t = self.lambda_raw[t]
-                fallback_alpha.append((~torch.isfinite(raw_a_t)).to(torch.float32).detach())
-                fallback_lambda.append((~torch.isfinite(raw_l_t)).to(torch.float32).detach())
+                # Per-step fallback statistics (raw param non-finite flags).
+                fallback_alpha.append(
+                    (
+                        (~torch.isfinite(self.alpha_theta_raw[t]))
+                        | (~torch.isfinite(self.alpha_r_raw[t]))
+                    )
+                    .to(torch.float32)
+                    .detach()
+                )
+                fallback_lambda.append(
+                    (
+                        (~torch.isfinite(self.lambda_theta_raw[t]))
+                        | (~torch.isfinite(self.lambda_r_raw[t]))
+                    )
+                    .to(torch.float32)
+                    .detach()
+                )
 
                 g_finite = torch.isfinite(g)
                 nonfinite_g_ratio.append((~g_finite).to(torch.float32).mean().detach())
                 g = torch.where(g_finite, g, torch.zeros_like(g))
 
-                denom = torch.abs(g).clamp_min(1e-6) + lambda_t
-                denom = torch.nan_to_num(denom, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1e-6)
+                g_th = g[:, 0]
+                g_r = g[:, 1]
 
-                step_u = alpha_t * g / denom
+                a_th = alpha_theta[t]
+                a_r = alpha_r[t]
+                l_th = lambda_theta[t]
+                l_r = lambda_r[t]
+
+                # Prevent NaN propagation.
+                a_th = torch.where(torch.isfinite(a_th), a_th, torch.full_like(a_th, self.init_alpha))
+                a_r = torch.where(torch.isfinite(a_r), a_r, torch.full_like(a_r, self.init_alpha))
+                l_th = torch.where(torch.isfinite(l_th), l_th, torch.full_like(l_th, self.init_lambda))
+                l_r = torch.where(torch.isfinite(l_r), l_r, torch.full_like(l_r, self.init_lambda))
+
+                denom_th = torch.abs(g_th).clamp_min(1e-6) + l_th
+                denom_r = torch.abs(g_r).clamp_min(1e-6) + l_r
+                denom_th = torch.nan_to_num(denom_th, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1e-6)
+                denom_r = torch.nan_to_num(denom_r, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1e-6)
+
+                step_th = a_th * g_th / denom_th
+                step_r = a_r * g_r / denom_r
+                step_u = torch.stack([step_th, step_r], dim=-1)
+                step_u = torch.nan_to_num(step_u, nan=0.0, posinf=0.0, neginf=0.0)
                 step_u = torch.clamp(step_u, -self.step_clip, self.step_clip)
-                # Detach the state to prevent unintended graph chaining / memory growth, but keep
-                # dependence on alpha/lambda via step_u.
-                u = u.detach() - step_u
+
+                u = u - step_u
 
                 if return_trace:
-                    Js.append(J.detach())
-                    thetas.append(theta.detach())
-                    rs.append(r.detach())
+                    obj_trace.append(obj.detach())
+                    theta_trace.append(theta.detach())
+                    r_trace.append(r.detach())
 
         theta_T, r_T = map_u_to_theta_r(u, self.box)
-        aT = steering_vector_torch(theta_T, r_T, self.cfg, dtype=z.dtype)
-        JT = normalized_correlation_torch(aT, z)
+        obj_T = self._objective_value(theta_T, r_T, z, beta)
+
+        debug: Dict[str, Any] = {
+            "obj": obj_T,
+            "ll_mean": obj_T.mean(),
+            "alpha_mean": torch.stack([alpha_theta[:steps], alpha_r[:steps]], dim=0).mean(),
+            "lambda_mean": torch.stack([lambda_theta[:steps], lambda_r[:steps]], dim=0).mean(),
+            "objective": self.objective,
+            "beta": beta if isinstance(beta, float) else float(beta.detach().cpu().item()),
+        }
 
         if not return_trace:
-            return theta_T, r_T, JT
-        return theta_T, r_T, JT, {
-            "J": Js,
-            "theta": thetas,
-            "r": rs,
+            return theta_T, r_T, debug
+        return theta_T, r_T, debug, {
+            "J": obj_trace,
+            "theta": theta_trace,
+            "r": r_trace,
             "nonfinite_g_ratio": nonfinite_g_ratio,
             "fallback_alpha": fallback_alpha,
             "fallback_lambda": fallback_lambda,
         }
+
