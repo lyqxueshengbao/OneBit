@@ -76,3 +76,9 @@ python -m scripts.eval_all --device cuda --run_ablations --ablation_snr_db 0 --a
 python -m scripts.train_unroll --device cuda --T 10 --steps 2000
 python -m scripts.eval_all --device cuda --ckpt_path runs/<your_train_run>/ckpt.pt
 ```
+
+如果你的旧 ckpt 里出现了 `alpha_raw/lambda_raw = NaN`（历史训练不稳定导致），评测时可用 `--sanitize_ckpt` 先做 best-effort 修复，或直接重新训练生成干净 ckpt：
+
+```bash
+python -m scripts.eval_all --device cuda --ckpt_path runs/<your_train_run>/ckpt.pt --sanitize_ckpt
+```

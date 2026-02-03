@@ -85,6 +85,8 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)
+    last_good_state = {k: v.detach().cpu().clone() for k, v in refiner.state_dict().items()}
+    last_good_step = 0
 
     for step in range(1, args.steps + 1):
         theta_gt, r_gt, snr_db = sample_gt(
@@ -108,8 +110,22 @@ def main() -> None:
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
+        if not torch.isfinite(grad_norm):
+            print("NaN/Inf grad norm encountered. Stop.")
+            break
         opt.step()
+
+        with torch.no_grad():
+            params_finite = all(
+                torch.isfinite(p).all().item() for p in refiner.parameters()
+            )
+            if not params_finite:
+                print(f"NaN/Inf parameters encountered at step={step}. Reverting to last good.")
+                refiner.load_state_dict(last_good_state, strict=True)
+                break
+            last_good_state = {k: v.detach().cpu().clone() for k, v in refiner.state_dict().items()}
+            last_good_step = step
 
         if step % args.log_interval == 0:
             row = {
@@ -149,7 +165,17 @@ def main() -> None:
             print(val_row)
             refiner.train()
 
-    ckpt = {"state_dict": refiner.state_dict(), "cfg": cfg.__dict__, "args": vars(args)}
+    state_to_save = (
+        refiner.state_dict()
+        if all(torch.isfinite(p).all().item() for p in refiner.parameters())
+        else last_good_state
+    )
+    ckpt = {
+        "state_dict": state_to_save,
+        "cfg": cfg.__dict__,
+        "args": vars(args),
+        "last_good_step": int(last_good_step),
+    }
     torch.save(ckpt, run_dir / "ckpt.pt")
     print(f"Saved: {run_dir / 'ckpt.pt'}")
 

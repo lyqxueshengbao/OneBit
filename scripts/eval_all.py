@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r_step", type=float, default=100.0)
     p.add_argument("--nm_maxiter", type=int, default=60)
     p.add_argument("--ckpt_path", type=str, default="")
+    p.add_argument("--sanitize_ckpt", action="store_true")
     p.add_argument("--full", action="store_true")
     p.add_argument("--run_ablations", action="store_true")
     p.add_argument("--ablation_snr_db", type=float, default=0.0)
@@ -43,6 +44,46 @@ def ms_per_sample(dt_s: float, n: int) -> float:
     return 1000.0 * dt_s / max(int(n), 1)
 
 
+def _nonfinite_module_tensors(module: torch.nn.Module) -> list[str]:
+    bad: list[str] = []
+    for name, p in module.named_parameters(recurse=True):
+        if p is not None and (not torch.isfinite(p).all().item()):
+            bad.append(f"param:{name}")
+    for name, b in module.named_buffers(recurse=True):
+        if b is not None and (not torch.isfinite(b).all().item()):
+            bad.append(f"buffer:{name}")
+    return bad
+
+
+def _sanitize_refiner_alpha_lambda(refiner: Refiner, *, init_alpha: float = 2e-2, init_lambda: float = 1e-3) -> None:
+    """
+    Best-effort sanitize for corrupted checkpoints where alpha_raw/lambda_raw become NaN/Inf.
+    """
+
+    with torch.no_grad():
+        device = refiner.alpha_raw.device
+        dtype = refiner.alpha_raw.dtype
+
+        def logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            p = p.clamp(eps, 1.0 - eps)
+            return torch.log(p) - torch.log1p(-p)
+
+        alpha0 = torch.full((refiner.T,), float(init_alpha), device=device, dtype=dtype)
+        lambda0 = torch.full((refiner.T,), float(init_lambda), device=device, dtype=dtype)
+
+        a_p = (alpha0 - float(refiner.alpha_min)) / (float(refiner.alpha_max) - float(refiner.alpha_min))
+        l_p = (lambda0 - float(refiner.lambda_min)) / (float(refiner.lambda_max) - float(refiner.lambda_min))
+        alpha_raw0 = logit(a_p)
+        lambda_raw0 = logit(l_p)
+
+        refiner.alpha_raw.data = torch.where(
+            torch.isfinite(refiner.alpha_raw.data), refiner.alpha_raw.data, alpha_raw0
+        )
+        refiner.lambda_raw.data = torch.where(
+            torch.isfinite(refiner.lambda_raw.data), refiner.lambda_raw.data, lambda_raw0
+        )
+
+
 def run_unrolled(
     z_np: np.ndarray,
     cfg: FDAConfig,
@@ -53,6 +94,7 @@ def run_unrolled(
     r_step: float,
     T: int,
     ckpt_path: str = "",
+    sanitize_ckpt: bool = False,
     learnable: bool = False,
     batch_size: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -78,6 +120,16 @@ def run_unrolled(
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
         refiner.load_state_dict(ckpt["state_dict"], strict=True)
+        bad = _nonfinite_module_tensors(refiner)
+        if bad:
+            if sanitize_ckpt:
+                _sanitize_refiner_alpha_lambda(refiner)
+                bad2 = _nonfinite_module_tensors(refiner)
+                if bad2:
+                    raise RuntimeError(f"Checkpoint has non-finite tensors after sanitize: {bad2}")
+                print(f"[warn] Sanitized non-finite ckpt tensors: {bad}")
+            else:
+                raise RuntimeError(f"Checkpoint has non-finite tensors: {bad}")
     refiner.eval()
 
     n = z.shape[0]
@@ -227,6 +279,7 @@ def main() -> None:
             r_step=args.r_step,
             T=args.T,
             ckpt_path="",
+            sanitize_ckpt=False,
             learnable=False,
             batch_size=args.batch_size,
         )
@@ -245,30 +298,43 @@ def main() -> None:
 
         # 4) grid + unrolled (learned) GPU batch
         if args.ckpt_path:
-            th_ul, r_ul, ms_ul = run_unrolled(
-                z,
-                cfg,
-                box,
-                device=device,
-                theta_step=args.theta_step,
-                r_step=args.r_step,
-                T=args.T,
-                ckpt_path=args.ckpt_path,
-                learnable=True,
-                batch_size=args.batch_size,
-            )
-            rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
-            rmse_r = rmse_np(r_ul - r_gt)
-            csv.log(
-                {
-                    "snr_db": snr_db,
-                    "method": "grid_unroll_learned",
-                    "rmse_theta_deg": rmse_theta,
-                    "rmse_r_m": rmse_r,
-                    "ms_per_sample": ms_ul,
-                    "notes": f"ckpt={args.ckpt_path}",
-                }
-            )
+            try:
+                th_ul, r_ul, ms_ul = run_unrolled(
+                    z,
+                    cfg,
+                    box,
+                    device=device,
+                    theta_step=args.theta_step,
+                    r_step=args.r_step,
+                    T=args.T,
+                    ckpt_path=args.ckpt_path,
+                    sanitize_ckpt=bool(args.sanitize_ckpt),
+                    learnable=True,
+                    batch_size=args.batch_size,
+                )
+                rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
+                rmse_r = rmse_np(r_ul - r_gt)
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": "grid_unroll_learned",
+                        "rmse_theta_deg": rmse_theta,
+                        "rmse_r_m": rmse_r,
+                        "ms_per_sample": ms_ul,
+                        "notes": f"ckpt={args.ckpt_path}",
+                    }
+                )
+            except RuntimeError as e:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": "grid_unroll_learned",
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip ({str(e)})",
+                    }
+                )
         else:
             csv.log(
                 {
@@ -328,6 +394,16 @@ def main() -> None:
         if ckpt_path:
             ckpt = torch.load(ckpt_path, map_location=device)
             refiner.load_state_dict(ckpt["state_dict"], strict=True)
+            bad = _nonfinite_module_tensors(refiner)
+            if bad:
+                if args.sanitize_ckpt:
+                    _sanitize_refiner_alpha_lambda(refiner)
+                    bad2 = _nonfinite_module_tensors(refiner)
+                    if bad2:
+                        raise RuntimeError(f"Checkpoint has non-finite tensors after sanitize: {bad2}")
+                    print(f"[warn] Sanitized non-finite ckpt tensors: {bad}")
+                else:
+                    raise RuntimeError(f"Checkpoint has non-finite tensors: {bad}")
         refiner.eval()
 
         if device.type == "cuda":
@@ -366,18 +442,31 @@ def main() -> None:
         )
 
         if args.ckpt_path:
-            th_hat, r_hat, ms_hat = run_unrolled_with_Trun(True, args.ckpt_path, T_run)
-            ab_csv.log(
-                {
-                    "snr_db": ab_snr,
-                    "method": "unroll_learned",
-                    "T_run": T_run,
-                    "rmse_theta_deg": rmse_np(angle_error_deg_np(th_hat, theta_gt)),
-                    "rmse_r_m": rmse_np(r_hat - r_gt),
-                    "ms_per_sample": ms_hat,
-                    "notes": f"ckpt={args.ckpt_path}",
-                }
-            )
+            try:
+                th_hat, r_hat, ms_hat = run_unrolled_with_Trun(True, args.ckpt_path, T_run)
+                ab_csv.log(
+                    {
+                        "snr_db": ab_snr,
+                        "method": "unroll_learned",
+                        "T_run": T_run,
+                        "rmse_theta_deg": rmse_np(angle_error_deg_np(th_hat, theta_gt)),
+                        "rmse_r_m": rmse_np(r_hat - r_gt),
+                        "ms_per_sample": ms_hat,
+                        "notes": f"ckpt={args.ckpt_path}",
+                    }
+                )
+            except RuntimeError as e:
+                ab_csv.log(
+                    {
+                        "snr_db": ab_snr,
+                        "method": "unroll_learned",
+                        "T_run": T_run,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip ({str(e)})",
+                    }
+                )
 
     # (B) coarse-grid step robustness at fixed SNR
     theta_steps = [float(x) for x in args.grid_theta_steps.split(",") if x.strip()]
@@ -466,6 +555,7 @@ def main() -> None:
                 r_step=rr_step,
                 T=args.T,
                 ckpt_path="",
+                sanitize_ckpt=False,
                 learnable=False,
                 batch_size=args.batch_size,
             )
@@ -483,30 +573,45 @@ def main() -> None:
             )
 
             if args.ckpt_path:
-                th_ul, r_ul, ms_ul = run_unrolled(
-                    z[:ab_n],
-                    cfg,
-                    box,
-                    device=device,
-                    theta_step=th_step,
-                    r_step=rr_step,
-                    T=args.T,
-                    ckpt_path=args.ckpt_path,
-                    learnable=True,
-                    batch_size=args.batch_size,
-                )
-                gr_csv.log(
-                    {
-                        "snr_db": ab_snr,
-                        "theta_step": th_step,
-                        "r_step": rr_step,
-                        "method": "grid_unroll_learned",
-                        "rmse_theta_deg": rmse_np(angle_error_deg_np(th_ul, theta_gt)),
-                        "rmse_r_m": rmse_np(r_ul - r_gt),
-                        "ms_per_sample": ms_ul,
-                        "notes": f"ckpt={args.ckpt_path}",
-                    }
-                )
+                try:
+                    th_ul, r_ul, ms_ul = run_unrolled(
+                        z[:ab_n],
+                        cfg,
+                        box,
+                        device=device,
+                        theta_step=th_step,
+                        r_step=rr_step,
+                        T=args.T,
+                        ckpt_path=args.ckpt_path,
+                        sanitize_ckpt=bool(args.sanitize_ckpt),
+                        learnable=True,
+                        batch_size=args.batch_size,
+                    )
+                    gr_csv.log(
+                        {
+                            "snr_db": ab_snr,
+                            "theta_step": th_step,
+                            "r_step": rr_step,
+                            "method": "grid_unroll_learned",
+                            "rmse_theta_deg": rmse_np(angle_error_deg_np(th_ul, theta_gt)),
+                            "rmse_r_m": rmse_np(r_ul - r_gt),
+                            "ms_per_sample": ms_ul,
+                            "notes": f"ckpt={args.ckpt_path}",
+                        }
+                    )
+                except RuntimeError as e:
+                    gr_csv.log(
+                        {
+                            "snr_db": ab_snr,
+                            "theta_step": th_step,
+                            "r_step": rr_step,
+                            "method": "grid_unroll_learned",
+                            "rmse_theta_deg": "",
+                            "rmse_r_m": "",
+                            "ms_per_sample": "",
+                            "notes": f"skip ({str(e)})",
+                        }
+                    )
 
     print(f"Wrote: {run_dir / 'ablate_T.csv'}")
     print(f"Wrote: {run_dir / 'grid_robustness.csv'}")
