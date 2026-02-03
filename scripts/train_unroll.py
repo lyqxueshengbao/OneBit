@@ -103,12 +103,12 @@ def main() -> None:
             loss = loss + float(args.physics_weight) * torch.mean(-J_hat)
 
         if not torch.isfinite(loss):
-            print("Loss is NaN/Inf, stopping.")
+            print("NaN/Inf loss encountered. Stop.")
             break
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(refiner.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(refiner.parameters(), 1.0)
         opt.step()
 
         if step % args.log_interval == 0:

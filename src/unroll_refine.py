@@ -150,9 +150,13 @@ class Refiner(nn.Module):
                     (-J).sum(), u, create_graph=self.training, retain_graph=self.training
                 )[0]
                 alpha_t = alpha[t].clamp(1e-6, 0.2)
-                lambd_t = lambd[t].clamp(1e-4, 1.0)
-                denom = torch.abs(g).clamp_min(1e-6) + lambd_t
-                u = u - alpha_t * g / denom
+                lambda_t = lambd[t].clamp(1e-4, 1.0)
+
+                g = torch.where(torch.isfinite(g), g, torch.zeros_like(g))
+                denom = torch.abs(g).clamp_min(1e-6) + lambda_t
+                step_u = alpha_t * g / denom
+                step_u = torch.clamp(step_u, -1.0, 1.0)
+                u = u - step_u
 
                 if return_trace:
                     Js.append(J.detach())
