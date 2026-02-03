@@ -138,7 +138,7 @@ class Refiner(nn.Module):
 
         steps = self.T if T_run is None else min(int(T_run), self.T)
 
-        # 在 forward() 里，steps = ... 之后加：
+        # Always enable grad inside refinement so it works even if caller wraps `torch.no_grad()`.
         with torch.enable_grad():
             for t in range(steps):
                 u = u.requires_grad_(True)
@@ -149,7 +149,10 @@ class Refiner(nn.Module):
                 g = torch.autograd.grad(
                     (-J).sum(), u, create_graph=self.training, retain_graph=self.training
                 )[0]
-                u = u - alpha[t] * g / (torch.abs(g) + lambd[t])
+                alpha_t = alpha[t].clamp(1e-6, 0.2)
+                lambd_t = lambd[t].clamp(1e-4, 1.0)
+                denom = torch.abs(g).clamp_min(1e-6) + lambd_t
+                u = u - alpha_t * g / denom
 
                 if return_trace:
                     Js.append(J.detach())

@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--T", type=int, default=10)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--snr_min", type=float, default=-15.0)
     p.add_argument("--snr_max", type=float, default=15.0)
     p.add_argument("--theta_step", type=float, default=1.0)
@@ -102,9 +102,13 @@ def main() -> None:
         if args.physics_weight > 0:
             loss = loss + float(args.physics_weight) * torch.mean(-J_hat)
 
+        if not torch.isfinite(loss):
+            print("Loss is NaN/Inf, stopping.")
+            break
+
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(refiner.parameters(), max_norm=5.0)
+        nn.utils.clip_grad_norm_(refiner.parameters(), max_norm=1.0)
         opt.step()
 
         if step % args.log_interval == 0:
@@ -152,4 +156,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
