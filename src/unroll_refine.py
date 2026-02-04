@@ -189,6 +189,7 @@ class Refiner(nn.Module):
         second_order: bool = False,
         sanitize_in_forward: bool = False,
         return_trace: bool = False,
+        trace_detach: bool = True,
     ):
         """
         Args:
@@ -198,7 +199,8 @@ class Refiner(nn.Module):
           beta: likelihood sharpness
           second_order: if True, build higher-order graph (slow/unstable; default False)
           sanitize_in_forward: if True, use nan_to_num *views* of raw params for computation (no write-back)
-          return_trace: if True, return per-step traces (detached)
+          return_trace: if True, return per-step traces (detached by default)
+          trace_detach: if False, keep trace tensors differentiable (for training distillation)
 
         Returns:
           theta_T: (B,) deg
@@ -229,6 +231,7 @@ class Refiner(nn.Module):
         obj_trace = []
         theta_trace = []
         r_trace = []
+        u_trace = []
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
@@ -236,6 +239,7 @@ class Refiner(nn.Module):
         with torch.enable_grad():
             for t in range(steps):
                 u = u.requires_grad_(True)
+                u_prev = u
                 theta, r = map_u_to_theta_r(u, self.box, r_box=self.r_box)
                 obj = self._objective_value(theta, r, z, beta)  # (B,)
 
@@ -307,8 +311,14 @@ class Refiner(nn.Module):
 
                 if return_trace:
                     obj_trace.append(obj.detach())
-                    theta_trace.append(theta.detach())
-                    r_trace.append(r.detach())
+                    if trace_detach:
+                        theta_trace.append(theta.detach())
+                        r_trace.append(r.detach())
+                        u_trace.append(u_prev.detach())
+                    else:
+                        theta_trace.append(theta)
+                        r_trace.append(r)
+                        u_trace.append(u_prev)
 
         theta_T, r_T = map_u_to_theta_r(u, self.box, r_box=self.r_box)
         obj_T = self._objective_value(theta_T, r_T, z, beta)
@@ -328,6 +338,8 @@ class Refiner(nn.Module):
             "J": obj_trace,
             "theta": theta_trace,
             "r": r_trace,
+            "u": u_trace,
+            "u_T": u.detach() if trace_detach else u,
             "nonfinite_g_ratio": nonfinite_g_ratio,
             "fallback_alpha": fallback_alpha,
             "fallback_lambda": fallback_lambda,

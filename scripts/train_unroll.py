@@ -12,7 +12,7 @@ from src.dataset import TargetBox, synthesize_batch_torch
 from src.fda import FDAConfig
 from src.metrics import angle_error_deg_torch
 from src.nm_refine import refine_nelder_mead_with_history
-from src.unroll_refine import Box, Refiner
+from src.unroll_refine import Box, Refiner, map_theta_r_to_u, map_u_to_theta_r
 from src.utils import JsonlLogger, ensure_dir, seed_all, timestamp, write_json
 
 
@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="uniform",
         choices=["uniform", "late"],
+    )
+    p.add_argument(
+        "--kd_step_mode",
+        type=str,
+        default="abs",
+        choices=["abs", "delta_u", "delta_tr"],
     )
     p.add_argument("--w_gt", type=float, default=0.2)
     p.add_argument("--w_phys", type=float, default=0.05)
@@ -178,7 +184,9 @@ def main() -> None:
             and (float(args.w_kd_step_theta) > 0.0 or float(args.w_kd_step_r) > 0.0)
         )
         if want_trace:
-            theta_hat, r_hat, dbg, trace = refiner(z, theta0, r0, beta=beta, return_trace=True)
+            theta_hat, r_hat, dbg, trace = refiner(
+                z, theta0, r0, beta=beta, return_trace=True, trace_detach=False
+            )
         else:
             theta_hat, r_hat, dbg = refiner(z, theta0, r0, beta=beta)
             trace = None
@@ -239,35 +247,97 @@ def main() -> None:
                 loss_nm_snr_lt0 = masked_pair_mse(theta_nm_err, r_nm_err, ~kd_snr_ge0)
 
                 if want_trace and trace is not None and float(args.w_kd_step) > 0.0:
-                    # Student per-step states AFTER each update:
-                    # trace["theta"][t] is pre-update state; post-update for step t is next pre-update (or final).
-                    theta_pre = trace["theta"]
-                    r_pre = trace["r"]
-                    if len(theta_pre) < int(args.T) or len(r_pre) < int(args.T):
-                        raise RuntimeError("Unexpected trace length in refiner")
-                    theta_steps = torch.stack([*theta_pre[1:int(args.T)], theta_hat.detach()], dim=0)  # (T,B)
-                    r_steps = torch.stack([*r_pre[1:int(args.T)], r_hat.detach()], dim=0)  # (T,B)
+                    T = int(args.T)
+                    w_t = t_weights(T, str(args.kd_step_t_weight), device)  # (T,)
 
+                    # Teacher absolute trajectory (T, Bkd) in (theta,r)
                     th_teacher = torch.from_numpy(th_nm_hist).to(device=device).transpose(0, 1)  # (T,Bkd)
                     r_teacher = torch.from_numpy(r_nm_hist).to(device=device).transpose(0, 1)  # (T,Bkd)
-                    th_student = theta_steps[:, idx]
-                    r_student = r_steps[:, idx]
 
-                    w_t = t_weights(int(args.T), str(args.kd_step_t_weight), device).view(-1, 1)  # (T,1)
-                    hub_th = torch.nn.functional.huber_loss(
-                        th_student.to(torch.float32),
-                        th_teacher,
-                        delta=float(HUBER_DELTA_THETA_DEG),
-                        reduction="none",
-                    )
-                    hub_r = torch.nn.functional.huber_loss(
-                        r_student.to(torch.float32),
-                        r_teacher,
-                        delta=float(HUBER_DELTA_R_M),
-                        reduction="none",
-                    )
-                    loss_kd_step_theta = (w_t * hub_th.mean(dim=1, keepdim=True)).sum()
-                    loss_kd_step_r = (w_t * hub_r.mean(dim=1, keepdim=True)).sum()
+                    # Student u trajectory (pre-update states) to avoid autograd graph reuse issues from autograd.grad:
+                    # trace["u"][t] is u after t updates (pre-update for iter t+1); trace["u_T"] is final.
+                    u_pre = trace["u"]
+                    if len(u_pre) < T:
+                        raise RuntimeError("Unexpected u trace length in refiner")
+                    u_states_all = torch.stack([*u_pre[:T], trace["u_T"]], dim=0)  # (T+1,B,2)
+
+                    # Student absolute trajectory in (theta,r) after each update (T,Bkd).
+                    u_post = u_states_all[1:, idx, :].reshape(T * idx.numel(), 2)
+                    th_s_flat, r_s_flat = map_u_to_theta_r(u_post, refiner.box, r_box=refiner.r_box)
+                    th_student_abs = th_s_flat.view(T, -1)
+                    r_student_abs = r_s_flat.view(T, -1)
+
+                    if str(args.kd_step_mode) in ("abs", "delta_tr"):
+                        if str(args.kd_step_mode) == "abs":
+                            th_s = th_student_abs
+                            r_s = r_student_abs
+                            th_t = th_teacher
+                            r_t = r_teacher
+                        else:
+                            th0_kd = theta0[idx].to(torch.float32)
+                            r0_kd = r0[idx].to(torch.float32)
+                            th_s = th_student_abs - torch.cat([th0_kd.view(1, -1), th_student_abs[:-1]], dim=0)
+                            r_s = r_student_abs - torch.cat([r0_kd.view(1, -1), r_student_abs[:-1]], dim=0)
+                            th_t = th_teacher - torch.cat(
+                                [th0_kd.view(1, -1), th_teacher[:-1]], dim=0
+                            )
+                            r_t = r_teacher - torch.cat([r0_kd.view(1, -1), r_teacher[:-1]], dim=0)
+
+                        hub_th = torch.nn.functional.huber_loss(
+                            th_s.to(torch.float32),
+                            th_t,
+                            delta=float(HUBER_DELTA_THETA_DEG),
+                            reduction="none",
+                        )
+                        hub_r = torch.nn.functional.huber_loss(
+                            r_s.to(torch.float32),
+                            r_t,
+                            delta=float(HUBER_DELTA_R_M),
+                            reduction="none",
+                        )
+                        loss_kd_step_theta = (w_t * hub_th.mean(dim=1)).sum()
+                        loss_kd_step_r = (w_t * hub_r.mean(dim=1)).sum()
+                    elif str(args.kd_step_mode) == "delta_u":
+                        u_curr = u_states_all[:-1, idx, :]  # (T,Bkd,2)
+                        u_next = u_states_all[1:, idx, :]  # (T,Bkd,2)
+                        du_s = u_next - u_curr  # (T,Bkd,2)
+
+                        # Teacher u trajectory from its (theta,r) states.
+                        th0_kd = theta0[idx].to(torch.float32)
+                        r0_kd = r0[idx].to(torch.float32)
+                        u0_t = map_theta_r_to_u(th0_kd, r0_kd, refiner.box, r_box=refiner.r_box)  # (Bkd,2)
+                        u_t_states = map_theta_r_to_u(
+                            th_teacher.reshape(-1),
+                            r_teacher.reshape(-1),
+                            refiner.box,
+                            r_box=refiner.r_box,
+                        ).view(T, -1, 2)  # (T,Bkd,2)
+                        u_curr_t = torch.cat([u0_t.view(1, -1, 2), u_t_states[:-1]], dim=0)
+                        du_t = u_t_states - u_curr_t  # (T,Bkd,2)
+
+                        theta_half = 0.5 * (refiner.box.theta_max - refiner.box.theta_min)
+                        delta_u_theta = float(HUBER_DELTA_THETA_DEG) / float(theta_half)
+                        r_span = float(refiner.box.r_max - refiner.box.r_min)
+                        dr_du_center = (0.5 if str(refiner.r_box) == "tanh" else 0.25) * r_span
+                        delta_u_r = float(HUBER_DELTA_R_M) / float(dr_du_center)
+
+                        hub_u_th = torch.nn.functional.huber_loss(
+                            du_s[:, :, 0].to(torch.float32),
+                            du_t[:, :, 0].to(torch.float32),
+                            delta=float(delta_u_theta),
+                            reduction="none",
+                        )
+                        hub_u_r = torch.nn.functional.huber_loss(
+                            du_s[:, :, 1].to(torch.float32),
+                            du_t[:, :, 1].to(torch.float32),
+                            delta=float(delta_u_r),
+                            reduction="none",
+                        )
+                        loss_kd_step_theta = (w_t * hub_u_th.mean(dim=1)).sum()
+                        loss_kd_step_r = (w_t * hub_u_r.mean(dim=1)).sum()
+                    else:
+                        raise RuntimeError(f"Unknown kd_step_mode: {args.kd_step_mode}")
+
                     kd_step = float(args.w_kd_step_theta) * loss_kd_step_theta + float(args.w_kd_step_r) * loss_kd_step_r
                     loss_kd_step = float(args.w_kd_step) * kd_step
 
