@@ -118,6 +118,9 @@ class Refiner(nn.Module):
         box: Box = Box(),
         learnable: bool = True,
         r_box: str = "tanh",  # {"tanh","sigmoid"}
+        r_precond_mul: float = 1.0,
+        r_precond_pow: float = 1.0,
+        r_precond_learnable: bool = False,
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -133,6 +136,14 @@ class Refiner(nn.Module):
         self.box = box
         self.r_box = str(r_box)
         self.objective = str(objective)
+        self.r_precond_pow = float(r_precond_pow)
+        self.r_precond_learnable = bool(r_precond_learnable)
+        if self.r_precond_learnable:
+            self.r_precond_mul = nn.Parameter(torch.tensor(float(r_precond_mul), dtype=torch.float32))
+        else:
+            # Keep default behavior unchanged: when not learnable, this is a plain python float
+            # and is NOT saved into the state_dict.
+            self.r_precond_mul = float(r_precond_mul)
 
         self.init_alpha = float(init_alpha)
         self.init_lambda = float(init_lambda)
@@ -305,7 +316,13 @@ class Refiner(nn.Module):
                     dr_du1 = 0.5 * (self.box.r_max - self.box.r_min) * (1.0 - tanh_u1 * tanh_u1)
                     target_dr_du = 0.25 * (self.box.r_max - self.box.r_min)
                     scale_r = (float(target_dr_du) / (dr_du1 + 1e-6)).clamp(0.2, 5.0)
-                    step_u[:, 1] = step_u[:, 1] * scale_r
+                    scale_base = scale_r.clamp(1e-4, 1e4)
+                    # scale_final = (scale_r ** pow) * mul
+                    mul = self.r_precond_mul if self.r_precond_learnable else float(self.r_precond_mul)
+                    scale_final = (scale_base ** float(self.r_precond_pow)) * mul
+                    # Avoid in-place update (needed when mul is learnable).
+                    step_u_r = step_u[:, 1] * scale_final
+                    step_u = torch.stack([step_u[:, 0], step_u_r], dim=-1)
 
                 u = u - step_u
 

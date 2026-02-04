@@ -76,6 +76,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--w_gt", type=float, default=0.2)
     p.add_argument("--w_phys", type=float, default=0.05)
+    # r precondition scaling (only affects r update when refiner.r_box == "tanh")
+    p.add_argument("--r_precond_mul", type=float, default=1.0)
+    p.add_argument("--r_precond_pow", type=float, default=1.0)
+    p.add_argument("--r_precond_learnable", type=int, default=0, choices=[0, 1])
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -161,6 +165,9 @@ def main() -> None:
         T=args.T,
         box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
         learnable=True,
+        r_precond_mul=float(args.r_precond_mul),
+        r_precond_pow=float(args.r_precond_pow),
+        r_precond_learnable=bool(int(args.r_precond_learnable)),
     ).to(device)
 
     opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)

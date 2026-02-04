@@ -115,9 +115,28 @@ def run_unrolled(
         T=T,
         box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
         learnable=learnable,
+        r_precond_mul=1.0,
+        r_precond_pow=1.0,
+        r_precond_learnable=False,
     ).to(device)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
+        sd = ckpt["state_dict"]
+        ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+        r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
+        r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
+        r_precond_learnable = bool("r_precond_mul" in sd)
+
+        refiner = Refiner(
+            cfg,
+            T=T,
+            box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
+            learnable=learnable,
+            r_precond_mul=r_precond_mul,
+            r_precond_pow=r_precond_pow,
+            r_precond_learnable=r_precond_learnable,
+        ).to(device)
+        # Reload after rebuilding the module.
         refiner.load_state_dict(ckpt["state_dict"], strict=True)
         bad = _nonfinite_module_tensors(refiner)
         if bad:
