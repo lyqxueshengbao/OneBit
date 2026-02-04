@@ -77,6 +77,27 @@ python -m scripts.train_unroll --device cuda --T 10 --steps 2000
 python -m scripts.eval_all --device cuda --ckpt_path runs/<your_train_run>/ckpt.pt
 ```
 
+下面给一个更完整的“蒸馏到 NM teacher”的训练启动方式（Linux/bash），包含后台运行与日志重定向：
+
+```bash
+RUN=train_T10_kdNM_$(date +%Y%m%d_%H%M%S)
+mkdir -p runs/_logs
+CUDA_VISIBLE_DEVICES=1 nohup python -m scripts.train_unroll \
+  --device cuda \
+  --T 10 \
+  --steps 30000 \
+  --teacher nm \
+  --teacher_prob 0.25 \
+  --teacher_maxiter 40 \
+  --w_gt 1.0 \
+  --w_teacher 1.0 \
+  --w_phys 0.1 \
+  --grad_clip 1.0 \
+  --run_dir runs/${RUN} \
+  > runs/_logs/${RUN}.out 2>&1 &
+echo "log: runs/_logs/${RUN}.out"
+```
+
 如果你的旧 ckpt 里出现了 `alpha_raw/lambda_raw = NaN`（历史训练不稳定导致），评测时可用 `--sanitize_ckpt` 先做 best-effort 修复，或直接重新训练生成干净 ckpt：
 
 ```bash

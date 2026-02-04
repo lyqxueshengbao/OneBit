@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--teacher_prob", type=float, default=0.3)
     p.add_argument("--teacher_maxiter", type=int, default=60)
     p.add_argument("--w_nm", type=float, default=1.0)
+    # Backward-compatible alias for --w_nm (teacher weight)
+    p.add_argument("--w_teacher", type=float, default=None)
     p.add_argument("--w_gt", type=float, default=0.2)
     p.add_argument("--w_phys", type=float, default=0.05)
     p.add_argument("--run_dir", type=str, default="")
@@ -69,6 +71,8 @@ def sample_gt(batch: int, box: TargetBox, snr_min: float, snr_max: float, device
 
 def main() -> None:
     args = parse_args()
+    if args.w_teacher is not None:
+        args.w_nm = float(args.w_teacher)
     seed_all(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
