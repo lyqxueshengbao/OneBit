@@ -16,6 +16,9 @@ from src.unroll_refine import Box, Refiner
 from src.utils import JsonlLogger, ensure_dir, seed_all, timestamp, write_json
 
 
+R0 = 50.0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--device", type=str, default="cuda")
@@ -32,6 +35,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--val_interval", type=int, default=200)
     p.add_argument("--val_batches", type=int, default=5)
+    # Early stopping (based on validation metrics)
+    p.add_argument("--early_stop_patience", type=int, default=10)
+    p.add_argument("--early_stop_min_delta", type=float, default=0.0)
+    p.add_argument(
+        "--early_stop_metric",
+        type=str,
+        default="val_score",
+        choices=["val_score", "theta", "r"],
+    )
     # Likelihood sharpness schedule
     p.add_argument("--beta", type=float, default=0.5)
     p.add_argument("--beta_final", type=float, default=3.0)
@@ -122,6 +134,8 @@ def main() -> None:
     opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)
     last_good_state = {k: v.detach().cpu().clone() for k, v in refiner.state_dict().items()}
     last_good_step = 0
+    best_metric = float("inf")
+    bad_epochs = 0
 
     for step in range(1, args.steps + 1):
         beta = beta_schedule(step, args.steps, args.beta, args.beta_final, args.beta_warmup_frac)
@@ -252,8 +266,56 @@ def main() -> None:
                 "val_rmse_theta_deg": float(np.mean(rmses_t)),
                 "val_rmse_r_m": float(np.mean(rmses_r)),
             }
+            val_score = float(val_row["val_rmse_theta_deg"] + val_row["val_rmse_r_m"] / float(R0))
+            if args.early_stop_metric == "val_score":
+                current_metric = val_score
+            elif args.early_stop_metric == "theta":
+                current_metric = float(val_row["val_rmse_theta_deg"])
+            elif args.early_stop_metric == "r":
+                current_metric = float(val_row["val_rmse_r_m"])
+            else:
+                raise RuntimeError(f"Unknown early_stop_metric: {args.early_stop_metric}")
+
+            improved = (best_metric - current_metric) > float(args.early_stop_min_delta)
+            if improved:
+                best_metric = float(current_metric)
+                bad_epochs = 0
+                best_ckpt = {
+                    "state_dict": refiner.state_dict(),
+                    "T": int(args.T),
+                    "cfg": cfg.__dict__,
+                    "args": vars(args),
+                    "best_metric": float(best_metric),
+                    "best_step": int(step),
+                }
+                torch.save(best_ckpt, run_dir / "best.pt")
+            else:
+                bad_epochs += 1
+
+            val_row = {
+                **val_row,
+                "val_score": float(val_score),
+                "best_metric": float(best_metric),
+                "bad_epochs": int(bad_epochs),
+                "patience": int(args.early_stop_patience),
+            }
             logger.log(val_row)
-            print(val_row)
+            print(
+                f"[val] step={step} "
+                f"rmse_theta_deg={val_row['val_rmse_theta_deg']:.6g} "
+                f"rmse_r_m={val_row['val_rmse_r_m']:.6g} "
+                f"val_score={val_row['val_score']:.6g} "
+                f"best_metric={best_metric:.6g} "
+                f"bad={bad_epochs}/{int(args.early_stop_patience)}"
+            )
+            if bad_epochs >= int(args.early_stop_patience):
+                print(
+                    f"[early-stop] step={step} metric={args.early_stop_metric} "
+                    f"current={current_metric:.6g} best={best_metric:.6g} "
+                    f"min_delta={float(args.early_stop_min_delta):.6g} "
+                    f"patience={int(args.early_stop_patience)}"
+                )
+                break
             refiner.train()
 
     state_to_save = (
