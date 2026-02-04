@@ -38,7 +38,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta_warmup_frac", type=float, default=0.3)
     # NM teacher distillation
     p.add_argument("--teacher", type=str, default="nm", choices=["none", "nm"])
-    p.add_argument("--teacher_prob", type=float, default=0.3)
+    p.add_argument("--teacher_prob", type=float, default=1.0)
+    p.add_argument("--teacher_snr_min", type=float, default=0.0)
     p.add_argument("--teacher_maxiter", type=int, default=60)
     p.add_argument("--w_nm", type=float, default=1.0)
     # Backward-compatible alias for --w_nm (teacher weight)
@@ -51,6 +52,18 @@ def parse_args() -> argparse.Namespace:
 
 def mse_to_zero(x: torch.Tensor) -> torch.Tensor:
     return torch.mean(x * x)
+
+
+def masked_mse(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if mask.dtype != torch.bool:
+        raise TypeError("mask must be a bool tensor")
+    if mask.numel() == 0 or not mask.any().item():
+        return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    return mse_to_zero(x[mask])
+
+
+def masked_pair_mse(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return masked_mse(x, mask) + masked_mse(y, mask)
 
 
 def beta_schedule(step: int, total_steps: int, beta0: float, beta1: float, warmup_frac: float) -> float:
@@ -125,10 +138,16 @@ def main() -> None:
 
         # Distill to NM (on a subset for speed) + a small GT term + physics (-ll) regularizer.
         loss_nm = torch.tensor(0.0, device=device)
+        loss_nm_snr_ge0 = torch.tensor(0.0, device=device)
+        loss_nm_snr_lt0 = torch.tensor(0.0, device=device)
+        kd_active_ratio = 0.0
         if args.teacher == "nm" and args.teacher_prob > 0:
             with torch.no_grad():
-                mask = torch.rand(args.batch_size, device=device) < float(args.teacher_prob)
-                idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                kd_mask = (snr_db >= float(args.teacher_snr_min)) & (
+                    torch.rand(args.batch_size, device=device) < float(args.teacher_prob)
+                )
+                idx = torch.nonzero(kd_mask, as_tuple=False).squeeze(1)
+                kd_active_ratio = float(idx.numel()) / float(args.batch_size)
 
             if idx.numel() > 0:
                 z_np = z[idx].detach().cpu().numpy()
@@ -155,8 +174,15 @@ def main() -> None:
                 theta_nm_err = angle_error_deg_torch(theta_hat[idx], th_nm_t)
                 r_nm_err = r_hat[idx] - r_nm_t
                 loss_nm = mse_to_zero(theta_nm_err) + mse_to_zero(r_nm_err)
+                snr_kd = snr_db[idx]
+                kd_snr_ge0 = snr_kd >= 0.0
+                loss_nm_snr_ge0 = masked_pair_mse(theta_nm_err, r_nm_err, kd_snr_ge0)
+                loss_nm_snr_lt0 = masked_pair_mse(theta_nm_err, r_nm_err, ~kd_snr_ge0)
 
         loss_gt = mse_to_zero(theta_err) + mse_to_zero(r_err)
+        snr_ge0 = snr_db >= 0.0
+        loss_gt_snr_ge0 = masked_pair_mse(theta_err, r_err, snr_ge0)
+        loss_gt_snr_lt0 = masked_pair_mse(theta_err, r_err, ~snr_ge0)
         ll_mean = dbg["ll_mean"]
         loss = float(args.w_nm) * loss_nm + float(args.w_gt) * loss_gt + float(args.w_phys) * (-ll_mean)
 
@@ -196,6 +222,11 @@ def main() -> None:
                 "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
                 "loss_nm": float(loss_nm.item()),
                 "loss_gt": float(loss_gt.item()),
+                "kd_active_ratio": float(kd_active_ratio),
+                "loss_gt_snr_ge0": float(loss_gt_snr_ge0.item()),
+                "loss_gt_snr_lt0": float(loss_gt_snr_lt0.item()),
+                "loss_nm_snr_ge0": float(loss_nm_snr_ge0.item()),
+                "loss_nm_snr_lt0": float(loss_nm_snr_lt0.item()),
             }
             logger.log(row)
             print(row)
