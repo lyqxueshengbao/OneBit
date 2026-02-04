@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ablate_T_list", type=str, default="1,2,5,10")
     p.add_argument("--grid_theta_steps", type=str, default="1,2,5")
     p.add_argument("--grid_r_steps", type=str, default="50,100,200")
+    # Tiny per-sample scale preconditioner (pscale)
+    p.add_argument("--use_pscale", type=int, default=0, choices=[0, 1])
+    p.add_argument("--pscale_hidden", type=int, default=32)
+    p.add_argument("--pscale_detach_step", type=int, default=1, choices=[0, 1])
+    p.add_argument("--pscale_logrange", type=float, default=6.9)
+    p.add_argument("--pscale_amp", type=float, default=1.0)
+    p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
+    p.add_argument("--t_table_init", type=float, default=0.0)
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -96,6 +104,13 @@ def run_unrolled(
     sanitize_ckpt: bool = False,
     learnable: bool = False,
     batch_size: int = 512,
+    use_pscale: bool = False,
+    pscale_hidden: int = 32,
+    pscale_detach_step: bool = True,
+    pscale_logrange: float = 6.9,
+    pscale_amp: float = 1.0,
+    use_t_table: bool = False,
+    t_table_init: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     z = torch.from_numpy(z_np).to(device=device)
     if z.dtype != torch.complex64:
@@ -118,6 +133,13 @@ def run_unrolled(
         r_precond_mul=1.0,
         r_precond_pow=1.0,
         r_precond_learnable=False,
+        use_pscale=bool(use_pscale),
+        pscale_hidden=int(pscale_hidden),
+        pscale_detach_step=bool(pscale_detach_step),
+        pscale_logrange=float(pscale_logrange),
+        pscale_amp=float(pscale_amp),
+        use_t_table=bool(use_t_table),
+        t_table_init=float(t_table_init),
     ).to(device)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -126,6 +148,15 @@ def run_unrolled(
         r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
         r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
         r_precond_learnable = bool("r_precond_mul" in sd)
+        use_pscale_ckpt = bool(int(ckpt_args.get("use_pscale", 0))) or any(
+            str(k).startswith("pscale_mlp.") for k in sd.keys()
+        )
+        use_t_table_ckpt = bool(int(ckpt_args.get("use_t_table", 0))) or ("t_log_scale_table" in sd)
+        pscale_hidden_ckpt = int(ckpt_args.get("pscale_hidden", 32))
+        pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
+        pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
+        pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
+        t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
 
         refiner = Refiner(
             cfg,
@@ -135,9 +166,23 @@ def run_unrolled(
             r_precond_mul=r_precond_mul,
             r_precond_pow=r_precond_pow,
             r_precond_learnable=r_precond_learnable,
+            use_pscale=use_pscale_ckpt,
+            pscale_hidden=pscale_hidden_ckpt,
+            pscale_detach_step=pscale_detach_step_ckpt,
+            pscale_logrange=pscale_logrange_ckpt,
+            pscale_amp=pscale_amp_ckpt,
+            use_t_table=use_t_table_ckpt,
+            t_table_init=t_table_init_ckpt,
         ).to(device)
+        if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T):
+            old = sd["t_log_scale_table"]
+            new = torch.zeros((int(T), 2), dtype=old.dtype, device=old.device)
+            n = min(int(T), int(old.shape[0]))
+            new[:n] = old[:n]
+            sd = dict(sd)
+            sd["t_log_scale_table"] = new
         # Reload after rebuilding the module.
-        refiner.load_state_dict(ckpt["state_dict"], strict=True)
+        refiner.load_state_dict(sd, strict=True)
         bad = _nonfinite_module_tensors(refiner)
         if bad:
             if sanitize_ckpt:
@@ -312,6 +357,13 @@ def main() -> None:
             sanitize_ckpt=False,
             learnable=False,
             batch_size=args.batch_size,
+            use_pscale=bool(int(args.use_pscale)),
+            pscale_hidden=int(args.pscale_hidden),
+            pscale_detach_step=bool(int(args.pscale_detach_step)),
+            pscale_logrange=float(args.pscale_logrange),
+            pscale_amp=float(args.pscale_amp),
+            use_t_table=bool(int(args.use_t_table)),
+            t_table_init=float(args.t_table_init),
         )
         rmse_theta = rmse_np(angle_error_deg_np(th_u, theta_gt))
         rmse_r = rmse_np(r_u - r_gt)
@@ -341,6 +393,13 @@ def main() -> None:
                     sanitize_ckpt=bool(args.sanitize_ckpt),
                     learnable=True,
                     batch_size=args.batch_size,
+                    use_pscale=bool(int(args.use_pscale)),
+                    pscale_hidden=int(args.pscale_hidden),
+                    pscale_detach_step=bool(int(args.pscale_detach_step)),
+                    pscale_logrange=float(args.pscale_logrange),
+                    pscale_amp=float(args.pscale_amp),
+                    use_t_table=bool(int(args.use_t_table)),
+                    t_table_init=float(args.t_table_init),
                 )
                 rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
                 rmse_r = rmse_np(r_ul - r_gt)
@@ -420,10 +479,58 @@ def main() -> None:
             T=T_resolved,
             box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
             learnable=learned,
+            r_precond_mul=1.0,
+            r_precond_pow=1.0,
+            r_precond_learnable=False,
+            use_pscale=bool(int(args.use_pscale)),
+            pscale_hidden=int(args.pscale_hidden),
+            pscale_detach_step=bool(int(args.pscale_detach_step)),
+            pscale_logrange=float(args.pscale_logrange),
+            pscale_amp=float(args.pscale_amp),
+            use_t_table=bool(int(args.use_t_table)),
+            t_table_init=float(args.t_table_init),
         ).to(device)
         if ckpt_path:
             ckpt = torch.load(ckpt_path, map_location=device)
-            refiner.load_state_dict(ckpt["state_dict"], strict=True)
+            sd = ckpt["state_dict"]
+            ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+            r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
+            r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
+            r_precond_learnable = bool("r_precond_mul" in sd)
+            use_pscale_ckpt = bool(int(ckpt_args.get("use_pscale", 0))) or any(
+                str(k).startswith("pscale_mlp.") for k in sd.keys()
+            )
+            use_t_table_ckpt = bool(int(ckpt_args.get("use_t_table", 0))) or ("t_log_scale_table" in sd)
+            pscale_hidden_ckpt = int(ckpt_args.get("pscale_hidden", 32))
+            pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
+            pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
+            pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
+            t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
+
+            refiner = Refiner(
+                cfg,
+                T=T_resolved,
+                box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
+                learnable=learned,
+                r_precond_mul=r_precond_mul,
+                r_precond_pow=r_precond_pow,
+                r_precond_learnable=r_precond_learnable,
+                use_pscale=use_pscale_ckpt,
+                pscale_hidden=pscale_hidden_ckpt,
+                pscale_detach_step=pscale_detach_step_ckpt,
+                pscale_logrange=pscale_logrange_ckpt,
+                pscale_amp=pscale_amp_ckpt,
+                use_t_table=use_t_table_ckpt,
+                t_table_init=t_table_init_ckpt,
+            ).to(device)
+            if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T_resolved):
+                old = sd["t_log_scale_table"]
+                new = torch.zeros((int(T_resolved), 2), dtype=old.dtype, device=old.device)
+                n = min(int(T_resolved), int(old.shape[0]))
+                new[:n] = old[:n]
+                sd = dict(sd)
+                sd["t_log_scale_table"] = new
+            refiner.load_state_dict(sd, strict=True)
             bad = _nonfinite_module_tensors(refiner)
             if bad:
                 if args.sanitize_ckpt:
@@ -588,6 +695,13 @@ def main() -> None:
                 sanitize_ckpt=False,
                 learnable=False,
                 batch_size=args.batch_size,
+                use_pscale=bool(int(args.use_pscale)),
+                pscale_hidden=int(args.pscale_hidden),
+                pscale_detach_step=bool(int(args.pscale_detach_step)),
+                pscale_logrange=float(args.pscale_logrange),
+                pscale_amp=float(args.pscale_amp),
+                use_t_table=bool(int(args.use_t_table)),
+                t_table_init=float(args.t_table_init),
             )
             gr_csv.log(
                 {
@@ -616,6 +730,13 @@ def main() -> None:
                         sanitize_ckpt=bool(args.sanitize_ckpt),
                         learnable=True,
                         batch_size=args.batch_size,
+                        use_pscale=bool(int(args.use_pscale)),
+                        pscale_hidden=int(args.pscale_hidden),
+                        pscale_detach_step=bool(int(args.pscale_detach_step)),
+                        pscale_logrange=float(args.pscale_logrange),
+                        pscale_amp=float(args.pscale_amp),
+                        use_t_table=bool(int(args.use_t_table)),
+                        t_table_init=float(args.t_table_init),
                     )
                     gr_csv.log(
                         {

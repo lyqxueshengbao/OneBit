@@ -121,6 +121,13 @@ class Refiner(nn.Module):
         r_precond_mul: float = 1.0,
         r_precond_pow: float = 1.0,
         r_precond_learnable: bool = False,
+        use_pscale: bool = False,
+        pscale_hidden: int = 32,
+        pscale_detach_step: bool = True,
+        pscale_logrange: float = 6.9,
+        pscale_amp: float = 1.0,
+        use_t_table: bool = False,
+        t_table_init: float = 0.0,
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -144,6 +151,29 @@ class Refiner(nn.Module):
             # Keep default behavior unchanged: when not learnable, this is a plain python float
             # and is NOT saved into the state_dict.
             self.r_precond_mul = float(r_precond_mul)
+
+        # Tiny per-sample scale preconditioner (pscale) for update: u <- u - scale(step,t) * step_u
+        self.use_pscale = bool(use_pscale)
+        self.pscale_detach_step = bool(pscale_detach_step)
+        self.pscale_logrange = float(pscale_logrange)
+        self.pscale_amp = float(pscale_amp)
+        self.use_t_table = bool(use_t_table) and self.use_pscale
+
+        if self.use_pscale:
+            hid = int(pscale_hidden)
+            self.pscale_mlp = nn.Sequential(
+                nn.Linear(3, hid),
+                nn.SiLU(),
+                nn.Linear(hid, 2),
+            )
+            # Initialize to exact identity scaling: delta=0 => log_scale≈0 => scale≈1.
+            nn.init.zeros_(self.pscale_mlp[-1].weight)
+            nn.init.zeros_(self.pscale_mlp[-1].bias)
+
+        if self.use_t_table:
+            self.t_log_scale_table = nn.Parameter(
+                torch.full((self.T, 2), float(t_table_init), dtype=torch.float32)
+            )
 
         self.init_alpha = float(init_alpha)
         self.init_lambda = float(init_lambda)
@@ -243,6 +273,11 @@ class Refiner(nn.Module):
         theta_trace = []
         r_trace = []
         u_trace = []
+        pscale_sum = None
+        pscale_sumsq = None
+        pscale_count = 0
+        pscale_clamp_hits = None
+        pscale_clamp_total = 0.0
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
@@ -324,7 +359,42 @@ class Refiner(nn.Module):
                     step_u_r = step_u[:, 1] * scale_final
                     step_u = torch.stack([step_u[:, 0], step_u_r], dim=-1)
 
-                u = u - step_u
+                if self.use_pscale:
+                    input_step = step_u.detach() if self.pscale_detach_step else step_u
+                    denom = max(steps - 1, 1)
+                    t_scalar = float(t) / float(denom)
+                    t_in = torch.full(
+                        (input_step.shape[0], 1),
+                        t_scalar,
+                        device=input_step.device,
+                        dtype=input_step.dtype,
+                    )
+                    x = torch.cat([input_step, t_in], dim=-1)
+                    delta = torch.tanh(self.pscale_mlp(x)) * float(self.pscale_amp)
+                    log_scale = delta
+                    if self.use_t_table:
+                        log_scale = log_scale + self.t_log_scale_table[t].to(log_scale.dtype).view(1, 2)
+                    log_scale_raw = log_scale
+                    log_scale = log_scale.clamp(-float(self.pscale_logrange), float(self.pscale_logrange))
+                    scale = torch.exp(log_scale)
+                    u = u - scale * step_u
+
+                    with torch.no_grad():
+                        if pscale_sum is None:
+                            pscale_sum = torch.zeros((2,), device=scale.device, dtype=torch.float32)
+                            pscale_sumsq = torch.zeros((2,), device=scale.device, dtype=torch.float32)
+                            pscale_clamp_hits = torch.zeros((), device=scale.device, dtype=torch.float32)
+                        s = scale.detach().to(torch.float32)
+                        pscale_sum += s.sum(dim=0)
+                        pscale_sumsq += (s * s).sum(dim=0)
+                        pscale_count += int(s.shape[0])
+                        hit = (log_scale_raw.detach() > float(self.pscale_logrange)) | (
+                            log_scale_raw.detach() < -float(self.pscale_logrange)
+                        )
+                        pscale_clamp_hits += hit.to(torch.float32).sum()
+                        pscale_clamp_total += float(hit.numel())
+                else:
+                    u = u - step_u
 
                 if return_trace:
                     obj_trace.append(obj.detach())
@@ -348,6 +418,17 @@ class Refiner(nn.Module):
             "objective": self.objective,
             "beta": beta if isinstance(beta, float) else float(beta.detach().cpu().item()),
         }
+        if self.use_pscale and pscale_sum is not None:
+            mean = pscale_sum / max(float(pscale_count), 1.0)
+            var = pscale_sumsq / max(float(pscale_count), 1.0) - mean * mean
+            std = torch.sqrt(var.clamp_min(0.0))
+            debug["pscale_scale_mean"] = mean
+            debug["pscale_scale_std"] = std
+            debug["pscale_clamp_hit_ratio"] = pscale_clamp_hits / max(float(pscale_clamp_total), 1.0)
+            if self.use_t_table:
+                tbl = self.t_log_scale_table.detach().to(torch.float32)
+                debug["t_table_mean"] = tbl.mean(dim=0)
+                debug["t_table_std"] = tbl.std(dim=0, unbiased=False)
 
         if not return_trace:
             return theta_T, r_T, debug

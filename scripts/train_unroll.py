@@ -80,6 +80,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--r_precond_mul", type=float, default=1.0)
     p.add_argument("--r_precond_pow", type=float, default=1.0)
     p.add_argument("--r_precond_learnable", type=int, default=0, choices=[0, 1])
+    # Tiny per-sample scale preconditioner (pscale)
+    p.add_argument("--use_pscale", type=int, default=0, choices=[0, 1])
+    p.add_argument("--pscale_hidden", type=int, default=32)
+    p.add_argument("--pscale_detach_step", type=int, default=1, choices=[0, 1])
+    p.add_argument("--pscale_logrange", type=float, default=6.9)
+    p.add_argument("--pscale_amp", type=float, default=1.0)
+    p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
+    p.add_argument("--t_table_init", type=float, default=0.0)
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -168,6 +176,13 @@ def main() -> None:
         r_precond_mul=float(args.r_precond_mul),
         r_precond_pow=float(args.r_precond_pow),
         r_precond_learnable=bool(int(args.r_precond_learnable)),
+        use_pscale=bool(int(args.use_pscale)),
+        pscale_hidden=int(args.pscale_hidden),
+        pscale_detach_step=bool(int(args.pscale_detach_step)),
+        pscale_logrange=float(args.pscale_logrange),
+        pscale_amp=float(args.pscale_amp),
+        use_t_table=bool(int(args.use_t_table)),
+        t_table_init=float(args.t_table_init),
     ).to(device)
 
     opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)
@@ -405,6 +420,29 @@ def main() -> None:
                 "loss_kd_step_theta": float(loss_kd_step_theta.item()),
                 "loss_kd_step_r": float(loss_kd_step_r.item()),
             }
+            if "pscale_scale_mean" in dbg:
+                m = dbg["pscale_scale_mean"].detach().cpu().to(torch.float32)
+                s = dbg["pscale_scale_std"].detach().cpu().to(torch.float32)
+                row.update(
+                    {
+                        "pscale_mean_theta": float(m[0].item()),
+                        "pscale_mean_r": float(m[1].item()),
+                        "pscale_std_theta": float(s[0].item()),
+                        "pscale_std_r": float(s[1].item()),
+                        "pscale_clamp_hit_ratio": float(dbg["pscale_clamp_hit_ratio"].detach().cpu().item()),
+                    }
+                )
+            if "t_table_mean" in dbg:
+                tm = dbg["t_table_mean"].detach().cpu().to(torch.float32)
+                ts = dbg["t_table_std"].detach().cpu().to(torch.float32)
+                row.update(
+                    {
+                        "t_table_mean_theta": float(tm[0].item()),
+                        "t_table_mean_r": float(tm[1].item()),
+                        "t_table_std_theta": float(ts[0].item()),
+                        "t_table_std_r": float(ts[1].item()),
+                    }
+                )
             logger.log(row)
             print(row)
 
