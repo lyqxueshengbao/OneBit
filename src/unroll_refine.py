@@ -37,7 +37,27 @@ class Box:
     r_max: float = 2000.0
 
 
-def map_u_to_theta_r(u: torch.Tensor, box: Box) -> Tuple[torch.Tensor, torch.Tensor]:
+def _box01_from_u(u: torch.Tensor, *, mode: str) -> torch.Tensor:
+    if mode == "sigmoid":
+        return torch.sigmoid(u)
+    if mode == "tanh":
+        # tanh box: s = 0.5 * (tanh(u) + 1) ∈ [0,1]
+        return 0.5 * (torch.tanh(u) + 1.0)
+    raise ValueError(f"Unknown r_box mode: {mode}")
+
+
+def _inv_box01_to_u(s: torch.Tensor, *, mode: str, eps: float = 1e-6) -> torch.Tensor:
+    s = s.clamp(eps, 1.0 - eps)
+    if mode == "sigmoid":
+        return _inv_sigmoid(s, eps=eps)
+    if mode == "tanh":
+        # tanh box inverse: u = atanh(2s-1)
+        y = (2.0 * s - 1.0).clamp(-1.0 + eps, 1.0 - eps)
+        return _inv_tanh(y, eps=eps)
+    raise ValueError(f"Unknown r_box mode: {mode}")
+
+
+def map_u_to_theta_r(u: torch.Tensor, box: Box, *, r_box: str = "tanh") -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Map unconstrained u -> (theta,r) within the valid box.
 
@@ -52,11 +72,13 @@ def map_u_to_theta_r(u: torch.Tensor, box: Box) -> Tuple[torch.Tensor, torch.Ten
     theta_half = 0.5 * (box.theta_max - box.theta_min)
     theta = theta_mid + theta_half * torch.tanh(u[:, 0])
 
-    r = box.r_min + (box.r_max - box.r_min) * torch.sigmoid(u[:, 1])
+    # tanh box (default): more linear / gentler boundary saturation than sigmoid.
+    s = _box01_from_u(u[:, 1], mode=str(r_box))
+    r = box.r_min + (box.r_max - box.r_min) * s
     return theta, r
 
 
-def map_theta_r_to_u(theta_deg: torch.Tensor, r_m: torch.Tensor, box: Box) -> torch.Tensor:
+def map_theta_r_to_u(theta_deg: torch.Tensor, r_m: torch.Tensor, box: Box, *, r_box: str = "tanh") -> torch.Tensor:
     """
     Inverse map (theta,r) -> u via (atanh/logit).
     """
@@ -65,8 +87,9 @@ def map_theta_r_to_u(theta_deg: torch.Tensor, r_m: torch.Tensor, box: Box) -> to
     theta_half = 0.5 * (box.theta_max - box.theta_min)
     y_theta = (theta_deg - theta_mid) / theta_half
 
-    p_r = (r_m - box.r_min) / (box.r_max - box.r_min)
-    return torch.stack([_inv_tanh(y_theta), _inv_sigmoid(p_r)], dim=-1)
+    s_r = (r_m - box.r_min) / (box.r_max - box.r_min)
+    u_r = _inv_box01_to_u(s_r, mode=str(r_box))
+    return torch.stack([_inv_tanh(y_theta), u_r], dim=-1)
 
 
 class Refiner(nn.Module):
@@ -94,6 +117,7 @@ class Refiner(nn.Module):
         T: int = 10,
         box: Box = Box(),
         learnable: bool = True,
+        r_box: str = "tanh",  # {"tanh","sigmoid"}
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -107,6 +131,7 @@ class Refiner(nn.Module):
         self.cfg = cfg
         self.T = int(T)
         self.box = box
+        self.r_box = str(r_box)
         self.objective = str(objective)
 
         self.init_alpha = float(init_alpha)
@@ -182,7 +207,7 @@ class Refiner(nn.Module):
           trace (optional): dict with keys {"J","theta","r","nonfinite_g_ratio","fallback_alpha","fallback_lambda"}
         """
 
-        u = map_theta_r_to_u(theta0_deg, r0_m, self.box)
+        u = map_theta_r_to_u(theta0_deg, r0_m, self.box, r_box=self.r_box)
 
         raw_at = self.alpha_theta_raw
         raw_ar = self.alpha_r_raw
@@ -211,7 +236,7 @@ class Refiner(nn.Module):
         with torch.enable_grad():
             for t in range(steps):
                 u = u.requires_grad_(True)
-                theta, r = map_u_to_theta_r(u, self.box)
+                theta, r = map_u_to_theta_r(u, self.box, r_box=self.r_box)
                 obj = self._objective_value(theta, r, z, beta)  # (B,)
 
                 g = torch.autograd.grad(
@@ -268,6 +293,16 @@ class Refiner(nn.Module):
                 step_u = torch.nan_to_num(step_u, nan=0.0, posinf=0.0, neginf=0.0)
                 step_u = torch.clamp(step_u, -self.step_clip, self.step_clip)
 
+                if self.r_box == "tanh":
+                    # r precondition scaling:
+                    # Compensate for tanh saturation so a similar step_u produces a more constant Δr.
+                    u1 = u[:, 1].detach()
+                    tanh_u1 = torch.tanh(u1)
+                    dr_du1 = 0.5 * (self.box.r_max - self.box.r_min) * (1.0 - tanh_u1 * tanh_u1)
+                    target_dr_du = 0.25 * (self.box.r_max - self.box.r_min)
+                    scale_r = (float(target_dr_du) / (dr_du1 + 1e-6)).clamp(0.2, 5.0)
+                    step_u[:, 1] = step_u[:, 1] * scale_r
+
                 u = u - step_u
 
                 if return_trace:
@@ -275,7 +310,7 @@ class Refiner(nn.Module):
                     theta_trace.append(theta.detach())
                     r_trace.append(r.detach())
 
-        theta_T, r_T = map_u_to_theta_r(u, self.box)
+        theta_T, r_T = map_u_to_theta_r(u, self.box, r_box=self.r_box)
         obj_T = self._objective_value(theta_T, r_T, z, beta)
 
         debug: Dict[str, Any] = {
@@ -297,4 +332,3 @@ class Refiner(nn.Module):
             "fallback_alpha": fallback_alpha,
             "fallback_lambda": fallback_lambda,
         }
-
