@@ -126,6 +126,7 @@ class Refiner(nn.Module):
         pscale_detach_step: bool = True,
         pscale_logrange: float = 6.9,
         pscale_amp: float = 1.0,
+        pscale_input: str = "step,u,t",
         use_t_table: bool = False,
         t_table_init: float = 0.0,
         pscale_min_theta: float = 0.7,
@@ -168,9 +169,30 @@ class Refiner(nn.Module):
         self.pscale_max_r = float(pscale_max_r)
 
         if self.use_pscale:
+            # Parse pscale_input tokens (order preserved, deduped).
+            allowed = {"step", "u", "t"}
+            raw = [tok.strip().lower() for tok in str(pscale_input).split(",")]
+            tokens: list[str] = []
+            seen = set()
+            for tok in raw:
+                if not tok:
+                    continue
+                if tok not in allowed:
+                    raise ValueError(
+                        f"Invalid pscale_input token: {tok!r}. Allowed: {sorted(allowed)}. "
+                        f"Got: {pscale_input!r}"
+                    )
+                if tok not in seen:
+                    tokens.append(tok)
+                    seen.add(tok)
+            if not tokens:
+                raise ValueError(f"Empty pscale_input after parsing: {pscale_input!r}")
+            self.pscale_tokens = tokens
+            self.pscale_feat_dim = int(len(tokens))
+
             hid = int(pscale_hidden)
             self.pscale_mlp = nn.Sequential(
-                nn.Linear(3, hid),
+                nn.Linear(self.pscale_feat_dim, hid),
                 nn.SiLU(),
                 nn.Linear(hid, 2),
             )
@@ -239,6 +261,7 @@ class Refiner(nn.Module):
         sanitize_in_forward: bool = False,
         return_trace: bool = False,
         trace_detach: bool = True,
+        pscale_step_norm: float = 0.0,
     ):
         """
         Args:
@@ -369,16 +392,33 @@ class Refiner(nn.Module):
                     step_u = torch.stack([step_u[:, 0], step_u_r], dim=-1)
 
                 if self.use_pscale:
-                    input_step = step_u.detach() if self.pscale_detach_step else step_u
-                    denom = max(steps - 1, 1)
-                    t_scalar = float(t) / float(denom)
-                    t_in = torch.full(
-                        (input_step.shape[0], 1),
-                        t_scalar,
-                        device=input_step.device,
-                        dtype=input_step.dtype,
-                    )
-                    x = torch.cat([input_step, t_in], dim=-1)
+                    # Build pscale features according to tokens (each token contributes 1 scalar per sample).
+                    B = int(u.shape[0])
+                    feat_list = []
+                    denom_train = 1.0
+                    step_norm = float(pscale_step_norm)
+                    step_norm = max(0.0, min(1.0, step_norm))
+                    t_norm = float(t) / float(max(steps - 1, 1))
+
+                    u_for_feat = u.detach() if self.pscale_detach_step else u
+                    u_norm = torch.linalg.vector_norm(u_for_feat.to(torch.float32), ord=2, dim=-1)  # (B,)
+                    u_feat = torch.log1p(u_norm).clamp(0.0, 10.0).to(u.dtype)
+
+                    for tok in self.pscale_tokens:
+                        if tok == "step":
+                            feat_list.append(
+                                torch.full((B, 1), step_norm, device=u.device, dtype=u.dtype)
+                            )
+                        elif tok == "t":
+                            feat_list.append(
+                                torch.full((B, 1), t_norm, device=u.device, dtype=u.dtype)
+                            )
+                        elif tok == "u":
+                            feat_list.append(u_feat.view(B, 1))
+                        else:
+                            raise RuntimeError(f"Unexpected pscale token: {tok}")
+
+                    x = torch.cat(feat_list, dim=-1)
                     delta = torch.tanh(self.pscale_mlp(x)) * float(self.pscale_amp)
                     log_scale = delta
                     if self.use_t_table:

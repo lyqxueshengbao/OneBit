@@ -21,6 +21,29 @@ HUBER_DELTA_THETA_DEG = 1.0
 HUBER_DELTA_R_M = 10.0
 
 
+def parse_pscale_input_tokens(s: str) -> list[str]:
+    allowed = {"step", "u", "t"}
+    raw = [tok.strip().lower() for tok in str(s).split(",")]
+    tokens: list[str] = []
+    seen = set()
+    for tok in raw:
+        if not tok:
+            continue
+        if tok not in allowed:
+            raise ValueError(
+                f"Invalid --pscale_input token: {tok!r}. Allowed tokens: {sorted(allowed)}. "
+                f"Got input: {s!r}"
+            )
+        if tok not in seen:
+            tokens.append(tok)
+            seen.add(tok)
+    if not tokens:
+        raise ValueError(
+            f"Empty --pscale_input after parsing. Allowed tokens: {sorted(allowed)}. Got input: {s!r}"
+        )
+    return tokens
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--device", type=str, default="cuda")
@@ -86,6 +109,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_detach_step", type=int, default=1, choices=[0, 1])
     p.add_argument("--pscale_logrange", type=float, default=6.9)
     p.add_argument("--pscale_amp", type=float, default=1.0)
+    p.add_argument(
+        "--pscale_input",
+        type=str,
+        default="step,u,t",
+        help='Comma-separated tokens for pscale features. Supported: "step,u,t" (order matters; deduped).',
+    )
     p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
     p.add_argument("--t_table_init", type=float, default=0.0)
     p.add_argument("--pscale_min_theta", type=float, default=0.7)
@@ -157,6 +186,11 @@ def main() -> None:
     cfg = FDAConfig()
     box = TargetBox()
 
+    if int(args.use_pscale) == 1:
+        pscale_tokens = parse_pscale_input_tokens(args.pscale_input)
+        args.pscale_input = ",".join(pscale_tokens)
+        print(f"[pscale] input_tokens={pscale_tokens} feat_dim={len(pscale_tokens)}")
+
     run_dir = Path(args.run_dir) if args.run_dir else Path("runs") / f"train_{timestamp()}"
     ensure_dir(run_dir)
     write_json(
@@ -190,6 +224,7 @@ def main() -> None:
         pscale_detach_step=bool(int(args.pscale_detach_step)),
         pscale_logrange=float(args.pscale_logrange),
         pscale_amp=float(args.pscale_amp),
+        pscale_input=str(args.pscale_input),
         use_t_table=bool(int(args.use_t_table)),
         t_table_init=float(args.t_table_init),
         pscale_min_theta=float(args.pscale_min_theta),
@@ -246,6 +281,7 @@ def main() -> None:
         _, z, _ = synthesize_batch_torch(theta_gt, r_gt, snr_db, cfg)
 
         theta0, r0, _ = coarse.search(z)
+        pscale_step_norm = float(step - 1) / float(max(int(args.steps) - 1, 1))
         want_trace = (
             args.teacher == "nm"
             and float(args.teacher_prob) > 0.0
@@ -254,10 +290,16 @@ def main() -> None:
         )
         if want_trace:
             theta_hat, r_hat, dbg, trace = refiner(
-                z, theta0, r0, beta=beta, return_trace=True, trace_detach=False
+                z,
+                theta0,
+                r0,
+                beta=beta,
+                return_trace=True,
+                trace_detach=False,
+                pscale_step_norm=pscale_step_norm,
             )
         else:
-            theta_hat, r_hat, dbg = refiner(z, theta0, r0, beta=beta)
+            theta_hat, r_hat, dbg = refiner(z, theta0, r0, beta=beta, pscale_step_norm=pscale_step_norm)
             trace = None
 
         theta_err = angle_error_deg_torch(theta_hat, theta_gt)

@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_detach_step", type=int, default=1, choices=[0, 1])
     p.add_argument("--pscale_logrange", type=float, default=6.9)
     p.add_argument("--pscale_amp", type=float, default=1.0)
+    p.add_argument(
+        "--pscale_input",
+        type=str,
+        default="step,u,t",
+        help='Comma-separated tokens for pscale features. Supported: "step,u,t" (order matters; deduped).',
+    )
     p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
     p.add_argument("--t_table_init", type=float, default=0.0)
     p.add_argument("--pscale_min_theta", type=float, default=0.7)
@@ -113,6 +119,7 @@ def run_unrolled(
     pscale_detach_step: bool = True,
     pscale_logrange: float = 6.9,
     pscale_amp: float = 1.0,
+    pscale_input: str = "step,u,t",
     use_t_table: bool = False,
     t_table_init: float = 0.0,
     pscale_min_theta: float = 0.7,
@@ -146,6 +153,7 @@ def run_unrolled(
         pscale_detach_step=bool(pscale_detach_step),
         pscale_logrange=float(pscale_logrange),
         pscale_amp=float(pscale_amp),
+        pscale_input=str(pscale_input),
         use_t_table=bool(use_t_table),
         t_table_init=float(t_table_init),
         pscale_min_theta=float(pscale_min_theta),
@@ -168,6 +176,7 @@ def run_unrolled(
         pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
         pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
         pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
+        pscale_input_ckpt = str(ckpt_args.get("pscale_input", pscale_input))
         t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
         pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", pscale_min_theta))
         pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", pscale_max_theta))
@@ -187,6 +196,7 @@ def run_unrolled(
             pscale_detach_step=pscale_detach_step_ckpt,
             pscale_logrange=pscale_logrange_ckpt,
             pscale_amp=pscale_amp_ckpt,
+            pscale_input=pscale_input_ckpt,
             use_t_table=use_t_table_ckpt,
             t_table_init=t_table_init_ckpt,
             pscale_min_theta=pscale_min_theta_ckpt,
@@ -382,6 +392,7 @@ def main() -> None:
             pscale_detach_step=bool(int(args.pscale_detach_step)),
             pscale_logrange=float(args.pscale_logrange),
             pscale_amp=float(args.pscale_amp),
+            pscale_input=str(args.pscale_input),
             use_t_table=bool(int(args.use_t_table)),
             t_table_init=float(args.t_table_init),
             pscale_min_theta=float(args.pscale_min_theta),
@@ -422,6 +433,7 @@ def main() -> None:
                     pscale_detach_step=bool(int(args.pscale_detach_step)),
                     pscale_logrange=float(args.pscale_logrange),
                     pscale_amp=float(args.pscale_amp),
+                    pscale_input=str(args.pscale_input),
                     use_t_table=bool(int(args.use_t_table)),
                     t_table_init=float(args.t_table_init),
                     pscale_min_theta=float(args.pscale_min_theta),
@@ -515,6 +527,7 @@ def main() -> None:
             pscale_detach_step=bool(int(args.pscale_detach_step)),
             pscale_logrange=float(args.pscale_logrange),
             pscale_amp=float(args.pscale_amp),
+            pscale_input=str(args.pscale_input),
             use_t_table=bool(int(args.use_t_table)),
             t_table_init=float(args.t_table_init),
             pscale_min_theta=float(args.pscale_min_theta),
@@ -537,6 +550,7 @@ def main() -> None:
             pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
             pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
             pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
+            pscale_input_ckpt = str(ckpt_args.get("pscale_input", str(args.pscale_input)))
             t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
             pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", float(args.pscale_min_theta)))
             pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", float(args.pscale_max_theta)))
@@ -556,6 +570,7 @@ def main() -> None:
                 pscale_detach_step=pscale_detach_step_ckpt,
                 pscale_logrange=pscale_logrange_ckpt,
                 pscale_amp=pscale_amp_ckpt,
+                pscale_input=pscale_input_ckpt,
                 use_t_table=use_t_table_ckpt,
                 t_table_init=t_table_init_ckpt,
                 pscale_min_theta=pscale_min_theta_ckpt,
@@ -740,6 +755,7 @@ def main() -> None:
                 pscale_detach_step=bool(int(args.pscale_detach_step)),
                 pscale_logrange=float(args.pscale_logrange),
                 pscale_amp=float(args.pscale_amp),
+                pscale_input=str(args.pscale_input),
                 use_t_table=bool(int(args.use_t_table)),
                 t_table_init=float(args.t_table_init),
                 pscale_min_theta=float(args.pscale_min_theta),
@@ -779,6 +795,7 @@ def main() -> None:
                         pscale_detach_step=bool(int(args.pscale_detach_step)),
                         pscale_logrange=float(args.pscale_logrange),
                         pscale_amp=float(args.pscale_amp),
+                        pscale_input=str(args.pscale_input),
                         use_t_table=bool(int(args.use_t_table)),
                         t_table_init=float(args.t_table_init),
                         pscale_min_theta=float(args.pscale_min_theta),
