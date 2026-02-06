@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_amp", type=float, default=1.0)
     p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
     p.add_argument("--t_table_init", type=float, default=0.0)
+    p.add_argument("--pscale_min_theta", type=float, default=0.7)
+    p.add_argument("--pscale_max_theta", type=float, default=1.3)
+    p.add_argument("--pscale_min_r", type=float, default=0.7)
+    p.add_argument("--pscale_max_r", type=float, default=1.3)
+    p.add_argument("--pscale_reg_w", type=float, default=1e-3)
+    p.add_argument("--t_table_freeze_steps", type=int, default=2000)
+    p.add_argument("--t_table_lr_mult", type=float, default=0.1)
+    p.add_argument("--kd_warmup_steps", type=int, default=1500)
+    p.add_argument("--nm_ramp_steps", type=int, default=1500)
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -183,15 +192,53 @@ def main() -> None:
         pscale_amp=float(args.pscale_amp),
         use_t_table=bool(int(args.use_t_table)),
         t_table_init=float(args.t_table_init),
+        pscale_min_theta=float(args.pscale_min_theta),
+        pscale_max_theta=float(args.pscale_max_theta),
+        pscale_min_r=float(args.pscale_min_r),
+        pscale_max_r=float(args.pscale_max_r),
     ).to(device)
 
-    opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)
+    # Optimizer with optional separate param group for t_table.
+    t_table = getattr(refiner, "t_log_scale_table", None)
+    if t_table is None:
+        opt = torch.optim.Adam(refiner.parameters(), lr=args.lr)
+    else:
+        other_params = [p for p in refiner.parameters() if p is not t_table]
+        opt = torch.optim.Adam(
+            [
+                {"params": other_params, "lr": float(args.lr)},
+                {"params": [t_table], "lr": float(args.lr) * float(args.t_table_lr_mult)},
+            ]
+        )
     last_good_state = {k: v.detach().cpu().clone() for k, v in refiner.state_dict().items()}
     last_good_step = 0
     best_metric = float("inf")
     bad_epochs = 0
+    t_table_is_frozen = False
 
     for step in range(1, args.steps + 1):
+        # nm/likelihood/physics term schedule.
+        kd_warm = max(int(args.kd_warmup_steps), 0)
+        ramp = max(int(args.nm_ramp_steps), 0)
+        if step <= kd_warm:
+            nm_lambda_eff = 0.0
+        elif ramp <= 0:
+            nm_lambda_eff = float(args.w_phys)
+        else:
+            tt = min(step - kd_warm, ramp) / float(ramp)
+            nm_lambda_eff = float(args.w_phys) * float(tt)
+
+        # Freeze/unfreeze t_table if present.
+        t_table = getattr(refiner, "t_log_scale_table", None)
+        if t_table is not None and int(args.t_table_freeze_steps) > 0:
+            should_freeze = step <= int(args.t_table_freeze_steps)
+            if should_freeze and not t_table_is_frozen:
+                t_table.requires_grad_(False)
+                t_table_is_frozen = True
+            if (not should_freeze) and t_table_is_frozen:
+                t_table.requires_grad_(True)
+                t_table_is_frozen = False
+
         beta = beta_schedule(step, args.steps, args.beta, args.beta_final, args.beta_warmup_frac)
         theta_gt, r_gt, snr_db = sample_gt(
             args.batch_size, box, args.snr_min, args.snr_max, device
@@ -368,11 +415,17 @@ def main() -> None:
         loss_gt_snr_ge0 = masked_pair_mse(theta_err, r_err, snr_ge0)
         loss_gt_snr_lt0 = masked_pair_mse(theta_err, r_err, ~snr_ge0)
         ll_mean = dbg["ll_mean"]
+        loss_pscale_reg = (
+            float(args.pscale_reg_w) * dbg["pscale_reg_term"]
+            if "pscale_reg_term" in dbg and float(args.pscale_reg_w) > 0
+            else torch.tensor(0.0, device=device)
+        )
         loss = (
             float(args.w_nm) * loss_nm
             + float(args.w_gt) * loss_gt
-            + float(args.w_phys) * (-ll_mean)
+            + float(nm_lambda_eff) * (-ll_mean)
             + loss_kd_step
+            + loss_pscale_reg
         )
 
         if not torch.isfinite(loss):
@@ -419,6 +472,9 @@ def main() -> None:
                 "loss_kd_step": float(loss_kd_step.item()),
                 "loss_kd_step_theta": float(loss_kd_step_theta.item()),
                 "loss_kd_step_r": float(loss_kd_step_r.item()),
+                "pscale_reg_loss": float(loss_pscale_reg.item()),
+                "t_table_is_frozen": bool(t_table_is_frozen),
+                "nm_lambda_eff": float(nm_lambda_eff),
             }
             if "pscale_scale_mean" in dbg:
                 m = dbg["pscale_scale_mean"].detach().cpu().to(torch.float32)
@@ -429,7 +485,9 @@ def main() -> None:
                         "pscale_mean_r": float(m[1].item()),
                         "pscale_std_theta": float(s[0].item()),
                         "pscale_std_r": float(s[1].item()),
-                        "pscale_clamp_hit_ratio": float(dbg["pscale_clamp_hit_ratio"].detach().cpu().item()),
+                        "pscale_clamp_hit_ratio_theta": float(dbg["pscale_clamp_hit_ratio"][0].detach().cpu().item()),
+                        "pscale_clamp_hit_ratio_r": float(dbg["pscale_clamp_hit_ratio"][1].detach().cpu().item()),
+                        "pscale_clamp_hit_ratio": float(dbg["pscale_clamp_hit_ratio"].mean().detach().cpu().item()),
                     }
                 )
             if "t_table_mean" in dbg:

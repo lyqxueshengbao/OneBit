@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_amp", type=float, default=1.0)
     p.add_argument("--use_t_table", type=int, default=0, choices=[0, 1])
     p.add_argument("--t_table_init", type=float, default=0.0)
+    p.add_argument("--pscale_min_theta", type=float, default=0.7)
+    p.add_argument("--pscale_max_theta", type=float, default=1.3)
+    p.add_argument("--pscale_min_r", type=float, default=0.7)
+    p.add_argument("--pscale_max_r", type=float, default=1.3)
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -111,6 +115,10 @@ def run_unrolled(
     pscale_amp: float = 1.0,
     use_t_table: bool = False,
     t_table_init: float = 0.0,
+    pscale_min_theta: float = 0.7,
+    pscale_max_theta: float = 1.3,
+    pscale_min_r: float = 0.7,
+    pscale_max_r: float = 1.3,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     z = torch.from_numpy(z_np).to(device=device)
     if z.dtype != torch.complex64:
@@ -140,6 +148,10 @@ def run_unrolled(
         pscale_amp=float(pscale_amp),
         use_t_table=bool(use_t_table),
         t_table_init=float(t_table_init),
+        pscale_min_theta=float(pscale_min_theta),
+        pscale_max_theta=float(pscale_max_theta),
+        pscale_min_r=float(pscale_min_r),
+        pscale_max_r=float(pscale_max_r),
     ).to(device)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -157,6 +169,10 @@ def run_unrolled(
         pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
         pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
         t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
+        pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", pscale_min_theta))
+        pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", pscale_max_theta))
+        pscale_min_r_ckpt = float(ckpt_args.get("pscale_min_r", pscale_min_r))
+        pscale_max_r_ckpt = float(ckpt_args.get("pscale_max_r", pscale_max_r))
 
         refiner = Refiner(
             cfg,
@@ -173,6 +189,10 @@ def run_unrolled(
             pscale_amp=pscale_amp_ckpt,
             use_t_table=use_t_table_ckpt,
             t_table_init=t_table_init_ckpt,
+            pscale_min_theta=pscale_min_theta_ckpt,
+            pscale_max_theta=pscale_max_theta_ckpt,
+            pscale_min_r=pscale_min_r_ckpt,
+            pscale_max_r=pscale_max_r_ckpt,
         ).to(device)
         if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T):
             old = sd["t_log_scale_table"]
@@ -364,6 +384,10 @@ def main() -> None:
             pscale_amp=float(args.pscale_amp),
             use_t_table=bool(int(args.use_t_table)),
             t_table_init=float(args.t_table_init),
+            pscale_min_theta=float(args.pscale_min_theta),
+            pscale_max_theta=float(args.pscale_max_theta),
+            pscale_min_r=float(args.pscale_min_r),
+            pscale_max_r=float(args.pscale_max_r),
         )
         rmse_theta = rmse_np(angle_error_deg_np(th_u, theta_gt))
         rmse_r = rmse_np(r_u - r_gt)
@@ -400,6 +424,10 @@ def main() -> None:
                     pscale_amp=float(args.pscale_amp),
                     use_t_table=bool(int(args.use_t_table)),
                     t_table_init=float(args.t_table_init),
+                    pscale_min_theta=float(args.pscale_min_theta),
+                    pscale_max_theta=float(args.pscale_max_theta),
+                    pscale_min_r=float(args.pscale_min_r),
+                    pscale_max_r=float(args.pscale_max_r),
                 )
                 rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
                 rmse_r = rmse_np(r_ul - r_gt)
@@ -489,6 +517,10 @@ def main() -> None:
             pscale_amp=float(args.pscale_amp),
             use_t_table=bool(int(args.use_t_table)),
             t_table_init=float(args.t_table_init),
+            pscale_min_theta=float(args.pscale_min_theta),
+            pscale_max_theta=float(args.pscale_max_theta),
+            pscale_min_r=float(args.pscale_min_r),
+            pscale_max_r=float(args.pscale_max_r),
         ).to(device)
         if ckpt_path:
             ckpt = torch.load(ckpt_path, map_location=device)
@@ -506,6 +538,10 @@ def main() -> None:
             pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
             pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
             t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
+            pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", float(args.pscale_min_theta)))
+            pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", float(args.pscale_max_theta)))
+            pscale_min_r_ckpt = float(ckpt_args.get("pscale_min_r", float(args.pscale_min_r)))
+            pscale_max_r_ckpt = float(ckpt_args.get("pscale_max_r", float(args.pscale_max_r)))
 
             refiner = Refiner(
                 cfg,
@@ -522,6 +558,10 @@ def main() -> None:
                 pscale_amp=pscale_amp_ckpt,
                 use_t_table=use_t_table_ckpt,
                 t_table_init=t_table_init_ckpt,
+                pscale_min_theta=pscale_min_theta_ckpt,
+                pscale_max_theta=pscale_max_theta_ckpt,
+                pscale_min_r=pscale_min_r_ckpt,
+                pscale_max_r=pscale_max_r_ckpt,
             ).to(device)
             if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T_resolved):
                 old = sd["t_log_scale_table"]
@@ -702,6 +742,10 @@ def main() -> None:
                 pscale_amp=float(args.pscale_amp),
                 use_t_table=bool(int(args.use_t_table)),
                 t_table_init=float(args.t_table_init),
+                pscale_min_theta=float(args.pscale_min_theta),
+                pscale_max_theta=float(args.pscale_max_theta),
+                pscale_min_r=float(args.pscale_min_r),
+                pscale_max_r=float(args.pscale_max_r),
             )
             gr_csv.log(
                 {
@@ -737,6 +781,10 @@ def main() -> None:
                         pscale_amp=float(args.pscale_amp),
                         use_t_table=bool(int(args.use_t_table)),
                         t_table_init=float(args.t_table_init),
+                        pscale_min_theta=float(args.pscale_min_theta),
+                        pscale_max_theta=float(args.pscale_max_theta),
+                        pscale_min_r=float(args.pscale_min_r),
+                        pscale_max_r=float(args.pscale_max_r),
                     )
                     gr_csv.log(
                         {

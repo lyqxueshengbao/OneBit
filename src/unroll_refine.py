@@ -128,6 +128,10 @@ class Refiner(nn.Module):
         pscale_amp: float = 1.0,
         use_t_table: bool = False,
         t_table_init: float = 0.0,
+        pscale_min_theta: float = 0.7,
+        pscale_max_theta: float = 1.3,
+        pscale_min_r: float = 0.7,
+        pscale_max_r: float = 1.3,
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -158,6 +162,10 @@ class Refiner(nn.Module):
         self.pscale_logrange = float(pscale_logrange)
         self.pscale_amp = float(pscale_amp)
         self.use_t_table = bool(use_t_table) and self.use_pscale
+        self.pscale_min_theta = float(pscale_min_theta)
+        self.pscale_max_theta = float(pscale_max_theta)
+        self.pscale_min_r = float(pscale_min_r)
+        self.pscale_max_r = float(pscale_max_r)
 
         if self.use_pscale:
             hid = int(pscale_hidden)
@@ -278,6 +286,7 @@ class Refiner(nn.Module):
         pscale_count = 0
         pscale_clamp_hits = None
         pscale_clamp_total = 0.0
+        pscale_reg_sum = None
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
@@ -374,25 +383,38 @@ class Refiner(nn.Module):
                     log_scale = delta
                     if self.use_t_table:
                         log_scale = log_scale + self.t_log_scale_table[t].to(log_scale.dtype).view(1, 2)
-                    log_scale_raw = log_scale
                     log_scale = log_scale.clamp(-float(self.pscale_logrange), float(self.pscale_logrange))
-                    scale = torch.exp(log_scale)
+                    scale_raw = torch.exp(log_scale)
+
+                    # Clamp pscale in scale-space (per-dim), to prevent runaway/degenerate solutions.
+                    scale_min = torch.tensor(
+                        [self.pscale_min_theta, self.pscale_min_r],
+                        device=scale_raw.device,
+                        dtype=scale_raw.dtype,
+                    ).view(1, 2)
+                    scale_max = torch.tensor(
+                        [self.pscale_max_theta, self.pscale_max_r],
+                        device=scale_raw.device,
+                        dtype=scale_raw.dtype,
+                    ).view(1, 2)
+                    scale = torch.max(torch.min(scale_raw, scale_max), scale_min)
+
                     u = u - scale * step_u
 
                     with torch.no_grad():
                         if pscale_sum is None:
                             pscale_sum = torch.zeros((2,), device=scale.device, dtype=torch.float32)
                             pscale_sumsq = torch.zeros((2,), device=scale.device, dtype=torch.float32)
-                            pscale_clamp_hits = torch.zeros((), device=scale.device, dtype=torch.float32)
+                            pscale_clamp_hits = torch.zeros((2,), device=scale.device, dtype=torch.float32)
+                            pscale_reg_sum = torch.zeros((), device=scale.device, dtype=torch.float32)
                         s = scale.detach().to(torch.float32)
                         pscale_sum += s.sum(dim=0)
                         pscale_sumsq += (s * s).sum(dim=0)
                         pscale_count += int(s.shape[0])
-                        hit = (log_scale_raw.detach() > float(self.pscale_logrange)) | (
-                            log_scale_raw.detach() < -float(self.pscale_logrange)
-                        )
-                        pscale_clamp_hits += hit.to(torch.float32).sum()
-                        pscale_clamp_total += float(hit.numel())
+                        hit = (scale.detach() != scale_raw.detach()).to(torch.float32)  # (B,2)
+                        pscale_clamp_hits += hit.sum(dim=0)
+                        pscale_clamp_total += float(hit.shape[0])
+                        pscale_reg_sum += torch.mean(torch.sum((s - 1.0) * (s - 1.0), dim=-1))
                 else:
                     u = u - step_u
 
@@ -425,6 +447,7 @@ class Refiner(nn.Module):
             debug["pscale_scale_mean"] = mean
             debug["pscale_scale_std"] = std
             debug["pscale_clamp_hit_ratio"] = pscale_clamp_hits / max(float(pscale_clamp_total), 1.0)
+            debug["pscale_reg_term"] = pscale_reg_sum / max(float(steps), 1.0)
             if self.use_t_table:
                 tbl = self.t_log_scale_table.detach().to(torch.float32)
                 debug["t_table_mean"] = tbl.mean(dim=0)
