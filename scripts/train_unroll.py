@@ -657,9 +657,18 @@ def main() -> None:
             last_good_step = step
 
         if step % args.log_interval == 0:
+            loss_total_check = (
+                loss_gt
+                + float(nm_lambda_eff_used) * loss_nm
+                + loss_kd_step
+                + loss_pscale_reg
+            )
+            loss_check_diff = (loss - loss_total_check).detach().item()
             row = {
                 "step": step,
                 "loss": float(loss.item()),
+                "loss_total_check": float(loss_total_check.detach().item()),
+                "loss_check_diff": float(loss_check_diff),
                 "rmse_theta_deg": float(torch.sqrt(torch.mean(theta_err * theta_err)).item()),
                 "rmse_r_m": float(torch.sqrt(torch.mean(r_err * r_err)).item()),
                 "ll_mean": float(ll_mean.item()),
