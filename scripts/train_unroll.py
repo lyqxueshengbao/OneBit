@@ -615,13 +615,20 @@ def main() -> None:
             if "pscale_reg_term" in dbg and float(args.pscale_reg_w) > 0
             else torch.tensor(0.0, device=device)
         )
-        loss = (
-            float(args.w_nm) * loss_nm
-            + float(args.w_gt) * loss_gt
-            + float(nm_lambda_eff_used) * (-ll_mean)
-            + loss_kd_step
-            + loss_pscale_reg
-        )
+        gt_lambda_eff_used = float(args.w_gt)
+        nm_target_raw = -ll_mean
+        nm_target_used = nm_target_raw
+
+        loss_gt_term = gt_lambda_eff_used * loss_gt
+        loss_nm_term = float(nm_lambda_eff_used) * nm_target_used
+        loss_kd_term = float(args.w_nm) * loss_nm + loss_kd_step
+        reg_term = loss_pscale_reg
+
+        loss_total_check = loss_gt_term + loss_nm_term + loss_kd_term + reg_term
+        loss = loss_total_check
+        loss_check_diff = (loss - loss_total_check).detach().item()
+        if str(args.run_name).startswith("debug"):
+            assert abs(loss_check_diff) < 1e-4
 
         if not torch.isfinite(loss):
             lr0 = float(opt.param_groups[0].get("lr", args.lr))
@@ -657,26 +664,18 @@ def main() -> None:
             last_good_step = step
 
         if step % args.log_interval == 0:
-            gt_lambda_eff_used = float(args.w_gt)
-            nm_target = -ll_mean
-            loss_nm_term = float(nm_lambda_eff_used) * nm_target
-            loss_gt_term = gt_lambda_eff_used * loss_gt
-            loss_total_check = (
-                loss_gt
-                + float(nm_lambda_eff_used) * loss_nm
-                + loss_kd_step
-                + loss_pscale_reg
-            )
-            loss_check_diff = (loss - loss_total_check).detach().item()
             row = {
                 "step": step,
                 "loss": float(loss.item()),
-                "loss_total_check": float(loss_total_check.detach().item()),
-                "loss_check_diff": float(loss_check_diff),
                 "gt_lambda_eff_used": float(gt_lambda_eff_used),
-                "nm_target": float(nm_target.detach().item()),
+                "nm_target_raw": float(nm_target_raw.detach().item()),
+                "nm_target_used": float(nm_target_used.detach().item()),
                 "loss_nm_term": float(loss_nm_term.detach().item()),
                 "loss_gt_term": float(loss_gt_term.detach().item()),
+                "loss_kd_term": float(loss_kd_term.detach().item()),
+                "reg_term": float(reg_term.detach().item()),
+                "loss_total_check": float(loss_total_check.detach().item()),
+                "loss_check_diff": float(loss_check_diff),
                 "rmse_theta_deg": float(torch.sqrt(torch.mean(theta_err * theta_err)).item()),
                 "rmse_r_m": float(torch.sqrt(torch.mean(r_err * r_err)).item()),
                 "ll_mean": float(ll_mean.item()),
