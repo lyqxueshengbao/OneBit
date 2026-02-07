@@ -527,6 +527,31 @@ def main() -> None:
                     loss_kd_step = float(args.w_kd_step) * kd_step
 
         if dump_this_step and trace is not None:
+            # Debug-only quantiles for likelihood / NM target (no training logic impact).
+            ll_vec = dbg.get("obj", None)
+            if isinstance(ll_vec, torch.Tensor):
+                ll_flat = ll_vec.detach().to(torch.float32).reshape(-1)
+                finite = torch.isfinite(ll_flat)
+                if finite.any().item():
+                    ll_f = ll_flat[finite]
+                    q = torch.tensor([0.5, 0.9, 0.99], device=ll_f.device, dtype=ll_f.dtype)
+                    ll_q = torch.quantile(ll_f, q)
+                    nm_f = -ll_f
+                    nm_q = torch.quantile(nm_f, q)
+                    print(
+                        {
+                            "step": int(step),
+                            "ll_p50": float(ll_q[0].item()),
+                            "ll_p90": float(ll_q[1].item()),
+                            "ll_p99": float(ll_q[2].item()),
+                            "ll_min": float(ll_f.min().item()),
+                            "nm_target_p50": float(nm_q[0].item()),
+                            "nm_target_p90": float(nm_q[1].item()),
+                            "nm_target_p99": float(nm_q[2].item()),
+                            "nm_target_max": float(nm_f.max().item()),
+                        }
+                    )
+
             dump_n = min(2, int(args.batch_size))
             dump_idx = torch.randperm(int(args.batch_size), device=device)[:dump_n]
             z_dump = z[dump_idx].detach().cpu().numpy()
