@@ -60,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps_per_epoch", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--grad_clip", type=float, default=1.0)
+    # Global grad norm clipping (disabled by default; clip threshold in L2 norm).
+    p.add_argument("--grad_clip", type=float, default=0.0)
     p.add_argument("--snr_min", type=float, default=-15.0)
     p.add_argument("--snr_max", type=float, default=15.0)
     p.add_argument("--theta_step", type=float, default=1.0)
@@ -109,6 +110,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--w_gt", type=float, default=0.2)
     p.add_argument("--w_phys", type=float, default=0.05)
+    # Optional safety cap for nm_lambda_eff schedule.
+    p.add_argument("--nm_lambda_eff_max", type=float, default=None)
     # Normalized GT loss (theta/r joint optimization)
     p.add_argument("--theta_scale", type=float, default=10.0)
     p.add_argument("--r_scale", type=float, default=2000.0)
@@ -175,6 +178,22 @@ def masked_mse(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def masked_pair_mse(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return masked_mse(x, mask) + masked_mse(y, mask)
+
+
+def total_grad_norm_l2(parameters) -> torch.Tensor:
+    grads = []
+    for p in parameters:
+        if p is None:
+            continue
+        g = getattr(p, "grad", None)
+        if g is None:
+            continue
+        if g.is_sparse:
+            g = g.coalesce().values()
+        grads.append(torch.norm(g.detach(), p=2))
+    if not grads:
+        return torch.tensor(0.0)
+    return torch.linalg.vector_norm(torch.stack(grads), ord=2)
 
 
 def gt_loss(
@@ -350,12 +369,20 @@ def main() -> None:
         kd_warm = max(int(args.kd_warmup_steps), 0)
         ramp = max(int(args.nm_ramp_steps), 0)
         if step <= kd_warm:
-            nm_lambda_eff = 0.0
+            nm_lambda_eff_raw = 0.0
         elif ramp <= 0:
-            nm_lambda_eff = float(args.w_phys)
+            nm_lambda_eff_raw = float(args.w_phys)
         else:
             tt = min(step - kd_warm, ramp) / float(ramp)
-            nm_lambda_eff = float(args.w_phys) * float(tt)
+            nm_lambda_eff_raw = float(args.w_phys) * float(tt)
+
+        nm_lambda_eff_used = float(nm_lambda_eff_raw)
+        if args.nm_lambda_eff_max is not None:
+            cap = float(args.nm_lambda_eff_max)
+            if cap == 0.0:
+                nm_lambda_eff_used = 0.0
+            elif cap > 0.0:
+                nm_lambda_eff_used = float(min(float(nm_lambda_eff_used), cap))
 
         # Freeze/unfreeze t_table if present.
         t_table = getattr(refiner, "t_log_scale_table", None)
@@ -591,23 +618,33 @@ def main() -> None:
         loss = (
             float(args.w_nm) * loss_nm
             + float(args.w_gt) * loss_gt
-            + float(nm_lambda_eff) * (-ll_mean)
+            + float(nm_lambda_eff_used) * (-ll_mean)
             + loss_kd_step
             + loss_pscale_reg
         )
 
         if not torch.isfinite(loss):
-            print("NaN/Inf loss encountered. Rollback+save+stop.")
-            refiner.load_state_dict(last_good_state, strict=True)
-            break
+            lr0 = float(opt.param_groups[0].get("lr", args.lr))
+            print(
+                "[warn] NaN/Inf loss; skip optimizer step "
+                f"(step={step} nm_lambda_eff_raw={nm_lambda_eff_raw:.6g} nm_lambda_eff_used={nm_lambda_eff_used:.6g} lr={lr0:.6g})"
+            )
+            continue
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(refiner.parameters(), float(args.grad_clip))
-        if not torch.isfinite(grad_norm):
-            print("NaN/Inf grad norm encountered. Rollback+save+stop.")
-            refiner.load_state_dict(last_good_state, strict=True)
-            break
+        if float(args.grad_clip) > 0.0:
+            grad_norm_total = torch.nn.utils.clip_grad_norm_(refiner.parameters(), float(args.grad_clip))
+        else:
+            grad_norm_total = total_grad_norm_l2(refiner.parameters()).to(device=device)
+
+        if not torch.isfinite(grad_norm_total):
+            lr0 = float(opt.param_groups[0].get("lr", args.lr))
+            print(
+                "[warn] NaN/Inf grad norm; skip optimizer step "
+                f"(step={step} nm_lambda_eff_raw={nm_lambda_eff_raw:.6g} nm_lambda_eff_used={nm_lambda_eff_used:.6g} lr={lr0:.6g})"
+            )
+            continue
         opt.step()
 
         with torch.no_grad():
@@ -629,7 +666,10 @@ def main() -> None:
                 "alpha_mean": float(dbg["alpha_mean"].detach().cpu().item()),
                 "lambda_mean": float(dbg["lambda_mean"].detach().cpu().item()),
                 "beta": float(beta),
-                "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
+                "grad_norm": float(
+                    grad_norm_total.item() if isinstance(grad_norm_total, torch.Tensor) else grad_norm_total
+                ),
+                "grad_clip": float(args.grad_clip),
                 "loss_nm": float(loss_nm.item()),
                 "loss_gt": float(loss_gt.item()),
                 "loss_gt_theta": float(loss_gt_theta.item()),
@@ -644,7 +684,9 @@ def main() -> None:
                 "loss_kd_step_r": float(loss_kd_step_r.item()),
                 "pscale_reg_loss": float(loss_pscale_reg.item()),
                 "t_table_is_frozen": bool(t_table_is_frozen),
-                "nm_lambda_eff": float(nm_lambda_eff),
+                "nm_lambda_eff": float(nm_lambda_eff_used),
+                "nm_lambda_eff_raw": float(nm_lambda_eff_raw),
+                "nm_lambda_eff_used": float(nm_lambda_eff_used),
             }
             if "pscale_scale_mean" in dbg:
                 m = dbg["pscale_scale_mean"].detach().cpu().to(torch.float32)
