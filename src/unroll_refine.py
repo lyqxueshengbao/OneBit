@@ -141,6 +141,8 @@ class Refiner(nn.Module):
         lambda_min: float = 1e-6,
         lambda_max: float = 1.0,
         step_clip: float = 1e-1,
+        delta_theta_clip_deg: float = 5.0,
+        delta_r_clip_m: float = 200.0,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -212,6 +214,8 @@ class Refiner(nn.Module):
         self.lambda_min = float(lambda_min)
         self.lambda_max = float(lambda_max)
         self.step_clip = float(step_clip)
+        self.delta_theta_clip_deg = float(delta_theta_clip_deg)
+        self.delta_r_clip_m = float(delta_r_clip_m)
 
         a0 = torch.full((self.T,), float(init_alpha), dtype=torch.float32)
         l0 = torch.full((self.T,), float(init_lambda), dtype=torch.float32)
@@ -439,7 +443,36 @@ class Refiner(nn.Module):
                     ).view(1, 2)
                     scale = torch.max(torch.min(scale_raw, scale_max), scale_min)
 
-                    u = u - scale * step_u
+                    step_eff = scale * step_u
+
+                    if self.delta_theta_clip_deg > 0.0 or self.delta_r_clip_m > 0.0:
+                        theta_prev, r_prev = theta, r
+                        u_cand = u_prev - step_eff
+                        theta_cand, r_cand = map_u_to_theta_r(u_cand, self.box, r_box=self.r_box)
+                        dtheta = (theta_cand - theta_prev).detach()
+                        dr = (r_cand - r_prev).detach()
+
+                        scale_th = torch.ones_like(dtheta)
+                        scale_rr = torch.ones_like(dr)
+                        if self.delta_theta_clip_deg > 0.0:
+                            clip_th = torch.tensor(
+                                float(self.delta_theta_clip_deg),
+                                device=dtheta.device,
+                                dtype=dtheta.dtype,
+                            )
+                            scale_th = torch.minimum(scale_th, clip_th / (torch.abs(dtheta) + 1e-12))
+                        if self.delta_r_clip_m > 0.0:
+                            clip_rr = torch.tensor(
+                                float(self.delta_r_clip_m),
+                                device=dr.device,
+                                dtype=dr.dtype,
+                            )
+                            scale_rr = torch.minimum(scale_rr, clip_rr / (torch.abs(dr) + 1e-12))
+
+                        scale_tr = torch.stack([scale_th, scale_rr], dim=-1).clamp(0.0, 1.0)
+                        step_eff = step_eff * scale_tr
+
+                    u = u - step_eff
 
                     with torch.no_grad():
                         if pscale_sum is None:
@@ -456,7 +489,35 @@ class Refiner(nn.Module):
                         pscale_clamp_total += float(hit.shape[0])
                         pscale_reg_sum += torch.mean(torch.sum((s - 1.0) * (s - 1.0), dim=-1))
                 else:
-                    u = u - step_u
+                    step_eff = step_u
+                    if self.delta_theta_clip_deg > 0.0 or self.delta_r_clip_m > 0.0:
+                        theta_prev, r_prev = theta, r
+                        u_cand = u_prev - step_eff
+                        theta_cand, r_cand = map_u_to_theta_r(u_cand, self.box, r_box=self.r_box)
+                        dtheta = (theta_cand - theta_prev).detach()
+                        dr = (r_cand - r_prev).detach()
+
+                        scale_th = torch.ones_like(dtheta)
+                        scale_rr = torch.ones_like(dr)
+                        if self.delta_theta_clip_deg > 0.0:
+                            clip_th = torch.tensor(
+                                float(self.delta_theta_clip_deg),
+                                device=dtheta.device,
+                                dtype=dtheta.dtype,
+                            )
+                            scale_th = torch.minimum(scale_th, clip_th / (torch.abs(dtheta) + 1e-12))
+                        if self.delta_r_clip_m > 0.0:
+                            clip_rr = torch.tensor(
+                                float(self.delta_r_clip_m),
+                                device=dr.device,
+                                dtype=dr.dtype,
+                            )
+                            scale_rr = torch.minimum(scale_rr, clip_rr / (torch.abs(dr) + 1e-12))
+
+                        scale_tr = torch.stack([scale_th, scale_rr], dim=-1).clamp(0.0, 1.0)
+                        step_eff = step_eff * scale_tr
+
+                    u = u - step_eff
 
                 if return_trace:
                     obj_trace.append(obj.detach())

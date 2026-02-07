@@ -11,14 +11,12 @@ from src.coarse_search import CoarseSearcherTorch
 from src.dataset import TargetBox, synthesize_batch_torch
 from src.fda import FDAConfig
 from src.metrics import angle_error_deg_torch
-from src.nm_refine import refine_nelder_mead_with_history
+from src.nm_refine import refine_nelder_mead, refine_nelder_mead_with_history
 from src.unroll_refine import Box, Refiner, map_theta_r_to_u, map_u_to_theta_r
 from src.utils import JsonlLogger, ensure_dir, seed_all, timestamp, write_json
 
 
 R0 = 50.0
-HUBER_DELTA_THETA_DEG = 1.0
-HUBER_DELTA_R_M = 10.0
 
 
 def parse_pscale_input_tokens(s: str) -> list[str]:
@@ -99,6 +97,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--w_gt", type=float, default=0.2)
     p.add_argument("--w_phys", type=float, default=0.05)
+    # Normalized GT loss (theta/r joint optimization)
+    p.add_argument("--theta_scale", type=float, default=10.0)
+    p.add_argument("--r_scale", type=float, default=2000.0)
+    p.add_argument("--w_theta", type=float, default=1.0)
+    p.add_argument("--w_r", type=float, default=1.0)
+    p.add_argument("--huber_delta", type=float, default=1.0)
+    # Step-wise KD time weighting (alias for --kd_step_t_weight)
+    p.add_argument("--kd_time_weight", type=str, default=None, choices=["uniform", "late"])
+    # Optional debug trace dumping (off by default)
+    p.add_argument("--dump_trace_every", type=int, default=0)
     # r precondition scaling (only affects r update when refiner.r_box == "tanh")
     p.add_argument("--r_precond_mul", type=float, default=1.0)
     p.add_argument("--r_precond_pow", type=float, default=1.0)
@@ -134,6 +142,15 @@ def mse_to_zero(x: torch.Tensor) -> torch.Tensor:
     return torch.mean(x * x)
 
 
+def huber_to_zero(x: torch.Tensor, *, delta: float) -> torch.Tensor:
+    return torch.nn.functional.huber_loss(
+        x.to(torch.float32),
+        torch.zeros_like(x, dtype=torch.float32),
+        delta=float(delta),
+        reduction="mean",
+    ).to(x.dtype)
+
+
 def masked_mse(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if mask.dtype != torch.bool:
         raise TypeError("mask must be a bool tensor")
@@ -146,6 +163,51 @@ def masked_pair_mse(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> tor
     return masked_mse(x, mask) + masked_mse(y, mask)
 
 
+def gt_loss(
+    theta_err_deg: torch.Tensor,
+    r_err_m: torch.Tensor,
+    *,
+    theta_scale: float,
+    r_scale: float,
+    w_theta: float,
+    w_r: float,
+    huber_delta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    theta_n = theta_err_deg / float(theta_scale)
+    r_n = r_err_m / float(r_scale)
+    loss_theta = huber_to_zero(theta_n, delta=float(huber_delta))
+    loss_r = huber_to_zero(r_n, delta=float(huber_delta))
+    loss = float(w_theta) * loss_theta + float(w_r) * loss_r
+    return loss, loss_theta, loss_r
+
+
+def masked_gt_loss(
+    theta_err_deg: torch.Tensor,
+    r_err_m: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    theta_scale: float,
+    r_scale: float,
+    w_theta: float,
+    w_r: float,
+    huber_delta: float,
+) -> torch.Tensor:
+    if mask.dtype != torch.bool:
+        raise TypeError("mask must be a bool tensor")
+    if mask.numel() == 0 or not mask.any().item():
+        return torch.tensor(0.0, device=theta_err_deg.device, dtype=theta_err_deg.dtype)
+    loss, _, _ = gt_loss(
+        theta_err_deg[mask],
+        r_err_m[mask],
+        theta_scale=theta_scale,
+        r_scale=r_scale,
+        w_theta=w_theta,
+        w_r=w_r,
+        huber_delta=huber_delta,
+    )
+    return loss
+
+
 def t_weights(T: int, mode: str, device: torch.device) -> torch.Tensor:
     if T <= 0:
         raise ValueError("T must be positive")
@@ -155,7 +217,7 @@ def t_weights(T: int, mode: str, device: torch.device) -> torch.Tensor:
         t = torch.arange(1, T + 1, device=device, dtype=torch.float32) / float(T)
         w = t * t
     else:
-        raise ValueError(f"Unknown kd_step_t_weight: {mode}")
+        raise ValueError(f"Unknown kd_time_weight: {mode}")
     w = w / w.sum().clamp_min(1e-12)
     return w
 
@@ -282,12 +344,16 @@ def main() -> None:
 
         theta0, r0, _ = coarse.search(z)
         pscale_step_norm = float(step - 1) / float(max(int(args.steps) - 1, 1))
-        want_trace = (
+        kd_time_weight = str(args.kd_time_weight) if args.kd_time_weight is not None else str(args.kd_step_t_weight)
+        need_kd_step = (
             args.teacher == "nm"
             and float(args.teacher_prob) > 0.0
             and float(args.w_kd_step) > 0.0
             and (float(args.w_kd_step_theta) > 0.0 or float(args.w_kd_step_r) > 0.0)
         )
+        dump_every = int(args.dump_trace_every)
+        dump_this_step = dump_every > 0 and (step % dump_every == 0)
+        want_trace = bool(need_kd_step or dump_this_step)
         if want_trace:
             theta_hat, r_hat, dbg, trace = refiner(
                 z,
@@ -295,7 +361,7 @@ def main() -> None:
                 r0,
                 beta=beta,
                 return_trace=True,
-                trace_detach=False,
+                trace_detach=not bool(need_kd_step),
                 pscale_step_norm=pscale_step_norm,
             )
         else:
@@ -328,24 +394,37 @@ def main() -> None:
 
                 th_nm = np.zeros((idx.numel(),), dtype=np.float32)
                 r_nm = np.zeros((idx.numel(),), dtype=np.float32)
-                th_nm_hist = np.zeros((idx.numel(), int(args.T)), dtype=np.float32)
-                r_nm_hist = np.zeros((idx.numel(), int(args.T)), dtype=np.float32)
+                T = int(args.T)
+                th_nm_hist = np.zeros((idx.numel(), T), dtype=np.float32) if need_kd_step else None
+                r_nm_hist = np.zeros((idx.numel(), T), dtype=np.float32) if need_kd_step else None
                 for j in range(idx.numel()):
-                    maxiter = min(int(args.teacher_maxiter), int(args.T))
-                    res, th_h, r_h = refine_nelder_mead_with_history(
-                        z_np[j],
-                        float(th0_np[j]),
-                        float(r0_np[j]),
-                        cfg,
-                        theta_range=(box.theta_min, box.theta_max),
-                        r_range=(box.r_min, box.r_max),
-                        maxiter=maxiter,
-                        hist_len=int(args.T),
-                    )
+                    maxiter = int(args.teacher_maxiter)
+                    if need_kd_step:
+                        maxiter = min(maxiter, T)
+                        res, th_h, r_h = refine_nelder_mead_with_history(
+                            z_np[j],
+                            float(th0_np[j]),
+                            float(r0_np[j]),
+                            cfg,
+                            theta_range=(box.theta_min, box.theta_max),
+                            r_range=(box.r_min, box.r_max),
+                            maxiter=maxiter,
+                            hist_len=T,
+                        )
+                        th_nm_hist[j, :] = th_h
+                        r_nm_hist[j, :] = r_h
+                    else:
+                        res = refine_nelder_mead(
+                            z_np[j],
+                            float(th0_np[j]),
+                            float(r0_np[j]),
+                            cfg,
+                            theta_range=(box.theta_min, box.theta_max),
+                            r_range=(box.r_min, box.r_max),
+                            maxiter=maxiter,
+                        )
                     th_nm[j] = res.theta_deg
                     r_nm[j] = res.r_m
-                    th_nm_hist[j, :] = th_h
-                    r_nm_hist[j, :] = r_h
 
                 th_nm_t = torch.from_numpy(th_nm).to(device=device)
                 r_nm_t = torch.from_numpy(r_nm).to(device=device)
@@ -357,105 +436,120 @@ def main() -> None:
                 loss_nm_snr_ge0 = masked_pair_mse(theta_nm_err, r_nm_err, kd_snr_ge0)
                 loss_nm_snr_lt0 = masked_pair_mse(theta_nm_err, r_nm_err, ~kd_snr_ge0)
 
-                if want_trace and trace is not None and float(args.w_kd_step) > 0.0:
-                    T = int(args.T)
-                    w_t = t_weights(T, str(args.kd_step_t_weight), device)  # (T,)
+                if need_kd_step and trace is not None and float(args.w_kd_step) > 0.0:
+                    if th_nm_hist is None or r_nm_hist is None:
+                        raise RuntimeError("Missing NM history for step-wise KD")
+                    w_t = t_weights(T, kd_time_weight, device)  # (T,)
 
-                    # Teacher absolute trajectory (T, Bkd) in (theta,r)
-                    th_teacher = torch.from_numpy(th_nm_hist).to(device=device).transpose(0, 1)  # (T,Bkd)
-                    r_teacher = torch.from_numpy(r_nm_hist).to(device=device).transpose(0, 1)  # (T,Bkd)
+                    # Teacher trajectory (T,Bkd)
+                    th_teacher = torch.from_numpy(th_nm_hist).to(device=device).transpose(0, 1)
+                    r_teacher = torch.from_numpy(r_nm_hist).to(device=device).transpose(0, 1)
 
-                    # Student u trajectory (pre-update states) to avoid autograd graph reuse issues from autograd.grad:
-                    # trace["u"][t] is u after t updates (pre-update for iter t+1); trace["u_T"] is final.
+                    # Student u trajectory: u_states_all[t] is u after t updates; u_states_all[T] is final.
                     u_pre = trace["u"]
                     if len(u_pre) < T:
                         raise RuntimeError("Unexpected u trace length in refiner")
                     u_states_all = torch.stack([*u_pre[:T], trace["u_T"]], dim=0)  # (T+1,B,2)
 
-                    # Student absolute trajectory in (theta,r) after each update (T,Bkd).
+                    # Student absolute trajectory after each update (T,Bkd)
                     u_post = u_states_all[1:, idx, :].reshape(T * idx.numel(), 2)
                     th_s_flat, r_s_flat = map_u_to_theta_r(u_post, refiner.box, r_box=refiner.r_box)
-                    th_student_abs = th_s_flat.view(T, -1)
-                    r_student_abs = r_s_flat.view(T, -1)
+                    th_student = th_s_flat.view(T, -1)
+                    r_student = r_s_flat.view(T, -1)
 
-                    if str(args.kd_step_mode) in ("abs", "delta_tr"):
-                        if str(args.kd_step_mode) == "abs":
-                            th_s = th_student_abs
-                            r_s = r_student_abs
-                            th_t = th_teacher
-                            r_t = r_teacher
-                        else:
-                            th0_kd = theta0[idx].to(torch.float32)
-                            r0_kd = r0[idx].to(torch.float32)
-                            th_s = th_student_abs - torch.cat([th0_kd.view(1, -1), th_student_abs[:-1]], dim=0)
-                            r_s = r_student_abs - torch.cat([r0_kd.view(1, -1), r_student_abs[:-1]], dim=0)
-                            th_t = th_teacher - torch.cat(
-                                [th0_kd.view(1, -1), th_teacher[:-1]], dim=0
-                            )
-                            r_t = r_teacher - torch.cat([r0_kd.view(1, -1), r_teacher[:-1]], dim=0)
-
-                        hub_th = torch.nn.functional.huber_loss(
-                            th_s.to(torch.float32),
-                            th_t,
-                            delta=float(HUBER_DELTA_THETA_DEG),
-                            reduction="none",
-                        )
-                        hub_r = torch.nn.functional.huber_loss(
-                            r_s.to(torch.float32),
-                            r_t,
-                            delta=float(HUBER_DELTA_R_M),
-                            reduction="none",
-                        )
-                        loss_kd_step_theta = (w_t * hub_th.mean(dim=1)).sum()
-                        loss_kd_step_r = (w_t * hub_r.mean(dim=1)).sum()
-                    elif str(args.kd_step_mode) == "delta_u":
-                        u_curr = u_states_all[:-1, idx, :]  # (T,Bkd,2)
-                        u_next = u_states_all[1:, idx, :]  # (T,Bkd,2)
-                        du_s = u_next - u_curr  # (T,Bkd,2)
-
-                        # Teacher u trajectory from its (theta,r) states.
-                        th0_kd = theta0[idx].to(torch.float32)
-                        r0_kd = r0[idx].to(torch.float32)
-                        u0_t = map_theta_r_to_u(th0_kd, r0_kd, refiner.box, r_box=refiner.r_box)  # (Bkd,2)
-                        u_t_states = map_theta_r_to_u(
-                            th_teacher.reshape(-1),
-                            r_teacher.reshape(-1),
-                            refiner.box,
-                            r_box=refiner.r_box,
-                        ).view(T, -1, 2)  # (T,Bkd,2)
-                        u_curr_t = torch.cat([u0_t.view(1, -1, 2), u_t_states[:-1]], dim=0)
-                        du_t = u_t_states - u_curr_t  # (T,Bkd,2)
-
-                        theta_half = 0.5 * (refiner.box.theta_max - refiner.box.theta_min)
-                        delta_u_theta = float(HUBER_DELTA_THETA_DEG) / float(theta_half)
-                        r_span = float(refiner.box.r_max - refiner.box.r_min)
-                        dr_du_center = (0.5 if str(refiner.r_box) == "tanh" else 0.25) * r_span
-                        delta_u_r = float(HUBER_DELTA_R_M) / float(dr_du_center)
-
-                        hub_u_th = torch.nn.functional.huber_loss(
-                            du_s[:, :, 0].to(torch.float32),
-                            du_t[:, :, 0].to(torch.float32),
-                            delta=float(delta_u_theta),
-                            reduction="none",
-                        )
-                        hub_u_r = torch.nn.functional.huber_loss(
-                            du_s[:, :, 1].to(torch.float32),
-                            du_t[:, :, 1].to(torch.float32),
-                            delta=float(delta_u_r),
-                            reduction="none",
-                        )
-                        loss_kd_step_theta = (w_t * hub_u_th.mean(dim=1)).sum()
-                        loss_kd_step_r = (w_t * hub_u_r.mean(dim=1)).sum()
-                    else:
-                        raise RuntimeError(f"Unknown kd_step_mode: {args.kd_step_mode}")
-
+                    # Normalized trajectory alignment (theta wrap + r scaled)
+                    e_th = angle_error_deg_torch(th_student, th_teacher)  # (T,Bkd)
+                    e_r = (r_student - r_teacher) / float(args.r_scale)  # (T,Bkd)
+                    term_th = torch.mean((e_th / float(args.theta_scale)) ** 2, dim=1)  # (T,)
+                    term_r = torch.mean(e_r**2, dim=1)  # (T,)
+                    loss_kd_step_theta = (w_t * term_th).sum()
+                    loss_kd_step_r = (w_t * term_r).sum()
                     kd_step = float(args.w_kd_step_theta) * loss_kd_step_theta + float(args.w_kd_step_r) * loss_kd_step_r
                     loss_kd_step = float(args.w_kd_step) * kd_step
 
-        loss_gt = mse_to_zero(theta_err) + mse_to_zero(r_err)
+        if dump_this_step and trace is not None:
+            dump_n = min(2, int(args.batch_size))
+            dump_idx = torch.randperm(int(args.batch_size), device=device)[:dump_n]
+            z_dump = z[dump_idx].detach().cpu().numpy()
+            th0_dump = theta0[dump_idx].detach().cpu().numpy().astype(np.float32)
+            r0_dump = r0[dump_idx].detach().cpu().numpy().astype(np.float32)
+            th_gt_dump = theta_gt[dump_idx].detach().cpu().numpy().astype(np.float32)
+            r_gt_dump = r_gt[dump_idx].detach().cpu().numpy().astype(np.float32)
+            snr_dump = snr_db[dump_idx].detach().cpu().numpy().astype(np.float32)
+
+            T = int(args.T)
+            th_nm_hist_dump = np.zeros((dump_n, T), dtype=np.float32)
+            r_nm_hist_dump = np.zeros((dump_n, T), dtype=np.float32)
+            for j in range(dump_n):
+                maxiter = min(int(args.teacher_maxiter), T)
+                _, th_h, r_h = refine_nelder_mead_with_history(
+                    z_dump[j],
+                    float(th0_dump[j]),
+                    float(r0_dump[j]),
+                    cfg,
+                    theta_range=(box.theta_min, box.theta_max),
+                    r_range=(box.r_min, box.r_max),
+                    maxiter=maxiter,
+                    hist_len=T,
+                )
+                th_nm_hist_dump[j, :] = th_h
+                r_nm_hist_dump[j, :] = r_h
+
+            u_pre = trace["u"]
+            if len(u_pre) < T:
+                raise RuntimeError("Unexpected u trace length in refiner")
+            u_states_all = torch.stack([*u_pre[:T], trace["u_T"]], dim=0)  # (T+1,B,2)
+            u_sel = u_states_all[:, dump_idx, :].reshape((T + 1) * dump_n, 2)
+            th_s, r_s = map_u_to_theta_r(u_sel, refiner.box, r_box=refiner.r_box)
+            th_pred_hist = th_s.view(T + 1, dump_n).detach().cpu().numpy().astype(np.float32)
+            r_pred_hist = r_s.view(T + 1, dump_n).detach().cpu().numpy().astype(np.float32)
+
+            trace_dir = run_dir / "traces"
+            ensure_dir(trace_dir)
+            out_path = trace_dir / f"step_{step}.npz"
+            np.savez(
+                out_path,
+                theta0=th0_dump,
+                r0=r0_dump,
+                theta_gt=th_gt_dump,
+                r_gt=r_gt_dump,
+                theta_pred_hist=th_pred_hist,
+                r_pred_hist=r_pred_hist,
+                theta_nm_hist=np.concatenate([th0_dump[:, None], th_nm_hist_dump], axis=1),
+                r_nm_hist=np.concatenate([r0_dump[:, None], r_nm_hist_dump], axis=1),
+                snr_db=snr_dump,
+            )
+
+        loss_gt, loss_gt_theta, loss_gt_r = gt_loss(
+            theta_err,
+            r_err,
+            theta_scale=float(args.theta_scale),
+            r_scale=float(args.r_scale),
+            w_theta=float(args.w_theta),
+            w_r=float(args.w_r),
+            huber_delta=float(args.huber_delta),
+        )
         snr_ge0 = snr_db >= 0.0
-        loss_gt_snr_ge0 = masked_pair_mse(theta_err, r_err, snr_ge0)
-        loss_gt_snr_lt0 = masked_pair_mse(theta_err, r_err, ~snr_ge0)
+        loss_gt_snr_ge0 = masked_gt_loss(
+            theta_err,
+            r_err,
+            snr_ge0,
+            theta_scale=float(args.theta_scale),
+            r_scale=float(args.r_scale),
+            w_theta=float(args.w_theta),
+            w_r=float(args.w_r),
+            huber_delta=float(args.huber_delta),
+        )
+        loss_gt_snr_lt0 = masked_gt_loss(
+            theta_err,
+            r_err,
+            ~snr_ge0,
+            theta_scale=float(args.theta_scale),
+            r_scale=float(args.r_scale),
+            w_theta=float(args.w_theta),
+            w_r=float(args.w_r),
+            huber_delta=float(args.huber_delta),
+        )
         ll_mean = dbg["ll_mean"]
         loss_pscale_reg = (
             float(args.pscale_reg_w) * dbg["pscale_reg_term"]
@@ -506,6 +600,8 @@ def main() -> None:
                 "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
                 "loss_nm": float(loss_nm.item()),
                 "loss_gt": float(loss_gt.item()),
+                "loss_gt_theta": float(loss_gt_theta.item()),
+                "loss_gt_r": float(loss_gt_r.item()),
                 "kd_active_ratio": float(kd_active_ratio),
                 "loss_gt_snr_ge0": float(loss_gt_snr_ge0.item()),
                 "loss_gt_snr_lt0": float(loss_gt_snr_lt0.item()),
