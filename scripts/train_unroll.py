@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
+
+# Allow both `python -m scripts.train_unroll` and `python scripts/train_unroll.py`.
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from src.coarse_search import CoarseSearcherTorch
 from src.dataset import TargetBox, synthesize_batch_torch
@@ -47,7 +53,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--T", type=int, default=10)
-    p.add_argument("--steps", type=int, default=2000)
+    # Total optimization steps. If omitted, can be derived from --epochs * --steps_per_epoch (compat).
+    p.add_argument("--steps", type=int, default=None)
+    # Backward-compatible epoch-style interface (optional).
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--steps_per_epoch", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -73,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta_warmup_frac", type=float, default=0.3)
     # NM teacher distillation
     p.add_argument("--teacher", type=str, default="nm", choices=["none", "nm"])
+    # Backward-compatible alias for --teacher
+    p.add_argument("--kd_mode", type=str, default=None, choices=["none", "nm"])
     p.add_argument("--teacher_prob", type=float, default=1.0)
     p.add_argument("--teacher_snr_min", type=float, default=0.0)
     p.add_argument("--teacher_maxiter", type=int, default=60)
@@ -134,6 +146,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t_table_lr_mult", type=float, default=0.1)
     p.add_argument("--kd_warmup_steps", type=int, default=1500)
     p.add_argument("--nm_ramp_steps", type=int, default=1500)
+    # Backward-compatible name -> run_dir (runs/<run_name>)
+    p.add_argument("--run_name", type=str, default="")
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -242,6 +256,19 @@ def main() -> None:
     args = parse_args()
     if args.w_teacher is not None:
         args.w_nm = float(args.w_teacher)
+
+    # Backward-compat arg mappings.
+    if args.kd_mode is not None:
+        args.teacher = str(args.kd_mode)
+    if args.steps is None:
+        if args.epochs is not None or args.steps_per_epoch is not None:
+            if args.epochs is None or args.steps_per_epoch is None:
+                raise ValueError("--epochs and --steps_per_epoch must be provided together when --steps is omitted.")
+            args.steps = int(args.epochs) * int(args.steps_per_epoch)
+        else:
+            args.steps = 2000
+    args.steps = int(args.steps)
+
     seed_all(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -253,7 +280,12 @@ def main() -> None:
         args.pscale_input = ",".join(pscale_tokens)
         print(f"[pscale] input_tokens={pscale_tokens} feat_dim={len(pscale_tokens)}")
 
-    run_dir = Path(args.run_dir) if args.run_dir else Path("runs") / f"train_{timestamp()}"
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    elif args.run_name:
+        run_dir = Path("runs") / str(args.run_name)
+    else:
+        run_dir = Path("runs") / f"train_{timestamp()}"
     ensure_dir(run_dir)
     write_json(
         run_dir / "config.json",
