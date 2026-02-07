@@ -657,6 +657,10 @@ def main() -> None:
             last_good_step = step
 
         if step % args.log_interval == 0:
+            gt_lambda_eff_used = float(args.w_gt)
+            nm_target = -ll_mean
+            loss_nm_term = float(nm_lambda_eff_used) * nm_target
+            loss_gt_term = gt_lambda_eff_used * loss_gt
             loss_total_check = (
                 loss_gt
                 + float(nm_lambda_eff_used) * loss_nm
@@ -669,6 +673,10 @@ def main() -> None:
                 "loss": float(loss.item()),
                 "loss_total_check": float(loss_total_check.detach().item()),
                 "loss_check_diff": float(loss_check_diff),
+                "gt_lambda_eff_used": float(gt_lambda_eff_used),
+                "nm_target": float(nm_target.detach().item()),
+                "loss_nm_term": float(loss_nm_term.detach().item()),
+                "loss_gt_term": float(loss_gt_term.detach().item()),
                 "rmse_theta_deg": float(torch.sqrt(torch.mean(theta_err * theta_err)).item()),
                 "rmse_r_m": float(torch.sqrt(torch.mean(r_err * r_err)).item()),
                 "ll_mean": float(ll_mean.item()),
