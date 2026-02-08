@@ -101,6 +101,23 @@ def _sanitize_refiner_alpha_lambda(refiner: Refiner, *, init_alpha: float = 2e-2
             t.data = torch.where(torch.isfinite(t.data), t.data, raw0)
 
 
+def _infer_refiner_T_model_from_sd(sd: dict, *, T_fallback: int, learnable: bool) -> int:
+    t_model = int(T_fallback)
+    if not learnable:
+        return t_model
+    for name in (
+        "alpha_theta_raw",
+        "alpha_r_raw",
+        "lambda_theta_raw",
+        "lambda_r_raw",
+        "t_log_scale_table",
+    ):
+        tensor = sd.get(name, None)
+        if torch.is_tensor(tensor):
+            return int(tensor.numel())
+    return t_model
+
+
 def run_unrolled(
     z_np: np.ndarray,
     cfg: FDAConfig,
@@ -113,6 +130,8 @@ def run_unrolled(
     ckpt_path: str = "",
     sanitize_ckpt: bool = False,
     learnable: bool = False,
+    T_run: int | None = None,
+    return_meta: bool = False,
     batch_size: int = 512,
     use_pscale: bool = False,
     pscale_hidden: int = 32,
@@ -126,7 +145,7 @@ def run_unrolled(
     pscale_max_theta: float = 1.3,
     pscale_min_r: float = 0.7,
     pscale_max_r: float = 1.3,
-) -> tuple[np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, float] | tuple[np.ndarray, np.ndarray, float, int, int]:
     z = torch.from_numpy(z_np).to(device=device)
     if z.dtype != torch.complex64:
         z = z.to(torch.complex64)
@@ -161,10 +180,12 @@ def run_unrolled(
         pscale_min_r=float(pscale_min_r),
         pscale_max_r=float(pscale_max_r),
     ).to(device)
+    T_model = int(T)
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
         sd = ckpt["state_dict"]
         ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+        T_model = _infer_refiner_T_model_from_sd(sd, T_fallback=T, learnable=learnable)
         r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
         r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
         r_precond_learnable = bool("r_precond_mul" in sd)
@@ -185,7 +206,7 @@ def run_unrolled(
 
         refiner = Refiner(
             cfg,
-            T=T,
+            T=T_model,
             box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
             learnable=learnable,
             r_precond_mul=r_precond_mul,
@@ -204,10 +225,10 @@ def run_unrolled(
             pscale_min_r=pscale_min_r_ckpt,
             pscale_max_r=pscale_max_r_ckpt,
         ).to(device)
-        if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T):
+        if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T_model):
             old = sd["t_log_scale_table"]
-            new = torch.zeros((int(T), 2), dtype=old.dtype, device=old.device)
-            n = min(int(T), int(old.shape[0]))
+            new = torch.zeros((int(T_model), 2), dtype=old.dtype, device=old.device)
+            n = min(int(T_model), int(old.shape[0]))
             new[:n] = old[:n]
             sd = dict(sd)
             sd["t_log_scale_table"] = new
@@ -224,6 +245,8 @@ def run_unrolled(
             else:
                 raise RuntimeError(f"Checkpoint has non-finite tensors: {bad}")
     refiner.eval()
+    T_run_eff = int(T_model if T_run is None else T_run)
+    T_run_eff = max(0, min(T_run_eff, int(T_model)))
 
     n = z.shape[0]
     theta_hat = []
@@ -236,12 +259,14 @@ def run_unrolled(
         zb = z[i : i + batch_size]
         theta0, r0, _ = coarse.search(zb)
         with torch.enable_grad():
-            th, rr, _ = refiner(zb, theta0, r0)
+            th, rr, _ = refiner(zb, theta0, r0, T_run=T_run_eff)
         theta_hat.append(th.detach().cpu().numpy())
         r_hat.append(rr.detach().cpu().numpy())
     if device.type == "cuda":
         torch.cuda.synchronize()
     dt = time.perf_counter() - t0
+    if return_meta:
+        return np.concatenate(theta_hat), np.concatenate(r_hat), ms_per_sample(dt, n), int(T_model), int(T_run_eff)
     return np.concatenate(theta_hat), np.concatenate(r_hat), ms_per_sample(dt, n)
 
 
@@ -257,7 +282,7 @@ def main() -> None:
     cfg = FDAConfig()
     box = TargetBox()
 
-    # Resolve T to avoid checkpoint shape mismatch.
+    # Resolve requested runtime unroll T.
     ckpt_T = None
     if args.ckpt_path and args.T is None:
         try:
@@ -416,7 +441,7 @@ def main() -> None:
         # 4) grid + unrolled (learned) GPU batch
         if args.ckpt_path:
             try:
-                th_ul, r_ul, ms_ul = run_unrolled(
+                th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
                     z,
                     cfg,
                     box,
@@ -427,6 +452,8 @@ def main() -> None:
                     ckpt_path=args.ckpt_path,
                     sanitize_ckpt=bool(args.sanitize_ckpt),
                     learnable=True,
+                    T_run=T_resolved,
+                    return_meta=True,
                     batch_size=args.batch_size,
                     use_pscale=bool(int(args.use_pscale)),
                     pscale_hidden=int(args.pscale_hidden),
@@ -450,7 +477,7 @@ def main() -> None:
                         "rmse_theta_deg": rmse_theta,
                         "rmse_r_m": rmse_r,
                         "ms_per_sample": ms_ul,
-                        "notes": f"ckpt={args.ckpt_path}",
+                        "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
                     }
                 )
             except RuntimeError as e:
@@ -505,23 +532,20 @@ def main() -> None:
     )
 
     def run_unrolled_with_Trun(learned: bool, ckpt_path: str, T_run: int):
-        zt = torch.from_numpy(z).to(device=device, dtype=torch.complex64)
-        coarse = CoarseSearcherTorch(
+        return run_unrolled(
+            z[:ab_n],
             cfg,
-            theta_range=(box.theta_min, box.theta_max),
-            r_range=(box.r_min, box.r_max),
+            box,
+            device=device,
             theta_step=args.theta_step,
             r_step=args.r_step,
-            device=device,
-        )
-        refiner = Refiner(
-            cfg,
             T=T_resolved,
-            box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
-            learnable=learned,
-            r_precond_mul=1.0,
-            r_precond_pow=1.0,
-            r_precond_learnable=False,
+            ckpt_path=ckpt_path,
+            sanitize_ckpt=bool(args.sanitize_ckpt),
+            learnable=bool(learned),
+            T_run=int(T_run),
+            return_meta=True,
+            batch_size=args.batch_size,
             use_pscale=bool(int(args.use_pscale)),
             pscale_hidden=int(args.pscale_hidden),
             pscale_detach_step=bool(int(args.pscale_detach_step)),
@@ -534,98 +558,17 @@ def main() -> None:
             pscale_max_theta=float(args.pscale_max_theta),
             pscale_min_r=float(args.pscale_min_r),
             pscale_max_r=float(args.pscale_max_r),
-        ).to(device)
-        if ckpt_path:
-            ckpt = torch.load(ckpt_path, map_location=device)
-            sd = ckpt["state_dict"]
-            ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-            r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
-            r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
-            r_precond_learnable = bool("r_precond_mul" in sd)
-            use_pscale_ckpt = bool(int(ckpt_args.get("use_pscale", 0))) or any(
-                str(k).startswith("pscale_mlp.") for k in sd.keys()
-            )
-            use_t_table_ckpt = bool(int(ckpt_args.get("use_t_table", 0))) or ("t_log_scale_table" in sd)
-            pscale_hidden_ckpt = int(ckpt_args.get("pscale_hidden", 32))
-            pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
-            pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
-            pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
-            pscale_input_ckpt = str(ckpt_args.get("pscale_input", str(args.pscale_input)))
-            t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
-            pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", float(args.pscale_min_theta)))
-            pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", float(args.pscale_max_theta)))
-            pscale_min_r_ckpt = float(ckpt_args.get("pscale_min_r", float(args.pscale_min_r)))
-            pscale_max_r_ckpt = float(ckpt_args.get("pscale_max_r", float(args.pscale_max_r)))
-
-            refiner = Refiner(
-                cfg,
-                T=T_resolved,
-                box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
-                learnable=learned,
-                r_precond_mul=r_precond_mul,
-                r_precond_pow=r_precond_pow,
-                r_precond_learnable=r_precond_learnable,
-                use_pscale=use_pscale_ckpt,
-                pscale_hidden=pscale_hidden_ckpt,
-                pscale_detach_step=pscale_detach_step_ckpt,
-                pscale_logrange=pscale_logrange_ckpt,
-                pscale_amp=pscale_amp_ckpt,
-                pscale_input=pscale_input_ckpt,
-                use_t_table=use_t_table_ckpt,
-                t_table_init=t_table_init_ckpt,
-                pscale_min_theta=pscale_min_theta_ckpt,
-                pscale_max_theta=pscale_max_theta_ckpt,
-                pscale_min_r=pscale_min_r_ckpt,
-                pscale_max_r=pscale_max_r_ckpt,
-            ).to(device)
-            if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T_resolved):
-                old = sd["t_log_scale_table"]
-                new = torch.zeros((int(T_resolved), 2), dtype=old.dtype, device=old.device)
-                n = min(int(T_resolved), int(old.shape[0]))
-                new[:n] = old[:n]
-                sd = dict(sd)
-                sd["t_log_scale_table"] = new
-            refiner.load_state_dict(sd, strict=True)
-            bad = _nonfinite_module_tensors(refiner)
-            if bad:
-                if args.sanitize_ckpt:
-                    _sanitize_refiner_alpha_lambda(refiner)
-                    bad2 = _nonfinite_module_tensors(refiner)
-                    if bad2:
-                        raise RuntimeError(f"Checkpoint has non-finite tensors after sanitize: {bad2}")
-                    print(f"[warn] Sanitized non-finite ckpt tensors: {bad}")
-                else:
-                    raise RuntimeError(f"Checkpoint has non-finite tensors: {bad}")
-        refiner.eval()
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        ths = []
-        rs = []
-        for i in range(0, ab_n, args.batch_size):
-            zb = zt[i : i + args.batch_size]
-            theta0, r0, _ = coarse.search(zb)
-            with torch.enable_grad():
-                th, rr, _ = refiner(zb, theta0, r0, T_run=T_run)
-            ths.append(th.detach().cpu().numpy())
-            rs.append(rr.detach().cpu().numpy())
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-        th_hat = np.concatenate(ths)
-        r_hat = np.concatenate(rs)
-        return th_hat, r_hat, ms_per_sample(dt, ab_n)
+        )
 
     for T_run in ablate_T:
         if T_run > T_resolved:
             continue
-        th_hat, r_hat, ms_hat = run_unrolled_with_Trun(False, "", T_run)
+        th_hat, r_hat, ms_hat, _, T_run_eff = run_unrolled_with_Trun(False, "", T_run)
         ab_csv.log(
             {
                 "snr_db": ab_snr,
                 "method": "unroll_fixed",
-                "T_run": T_run,
+                "T_run": T_run_eff,
                 "rmse_theta_deg": rmse_np(angle_error_deg_np(th_hat, theta_gt)),
                 "rmse_r_m": rmse_np(r_hat - r_gt),
                 "ms_per_sample": ms_hat,
@@ -635,16 +578,18 @@ def main() -> None:
 
         if args.ckpt_path:
             try:
-                th_hat, r_hat, ms_hat = run_unrolled_with_Trun(True, args.ckpt_path, T_run)
+                th_hat, r_hat, ms_hat, T_model_hat, T_run_hat = run_unrolled_with_Trun(
+                    True, args.ckpt_path, T_run
+                )
                 ab_csv.log(
                     {
                         "snr_db": ab_snr,
                         "method": "unroll_learned",
-                        "T_run": T_run,
+                        "T_run": T_run_hat,
                         "rmse_theta_deg": rmse_np(angle_error_deg_np(th_hat, theta_gt)),
                         "rmse_r_m": rmse_np(r_hat - r_gt),
                         "ms_per_sample": ms_hat,
-                        "notes": f"ckpt={args.ckpt_path}",
+                        "notes": f"ckpt={args.ckpt_path}; T_model={T_model_hat}, T_run={T_run_hat}",
                     }
                 )
             except RuntimeError as e:
@@ -778,7 +723,7 @@ def main() -> None:
 
             if args.ckpt_path:
                 try:
-                    th_ul, r_ul, ms_ul = run_unrolled(
+                    th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
                         z[:ab_n],
                         cfg,
                         box,
@@ -789,6 +734,8 @@ def main() -> None:
                         ckpt_path=args.ckpt_path,
                         sanitize_ckpt=bool(args.sanitize_ckpt),
                         learnable=True,
+                        T_run=T_resolved,
+                        return_meta=True,
                         batch_size=args.batch_size,
                         use_pscale=bool(int(args.use_pscale)),
                         pscale_hidden=int(args.pscale_hidden),
@@ -812,7 +759,7 @@ def main() -> None:
                             "rmse_theta_deg": rmse_np(angle_error_deg_np(th_ul, theta_gt)),
                             "rmse_r_m": rmse_np(r_ul - r_gt),
                             "ms_per_sample": ms_ul,
-                            "notes": f"ckpt={args.ckpt_path}",
+                            "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
                         }
                     )
                 except RuntimeError as e:
