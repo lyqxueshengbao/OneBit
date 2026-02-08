@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_max_theta", type=float, default=1.3)
     p.add_argument("--pscale_min_r", type=float, default=0.7)
     p.add_argument("--pscale_max_r", type=float, default=1.3)
+    # Monotone accept-reject / backtracking for each unroll step.
+    p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
+    p.add_argument("--ar_backtrack_max", type=int, default=0)
+    p.add_argument("--ar_backtrack_factor", type=float, default=0.5)
+    p.add_argument("--ar_min_scale", type=float, default=0.1)
+    p.add_argument("--ar_accept_tol", type=float, default=0.0)
     p.add_argument("--run_dir", type=str, default="")
     return p.parse_args()
 
@@ -170,6 +176,11 @@ def run_unrolled(
     pscale_max_theta: float = 1.3,
     pscale_min_r: float = 0.7,
     pscale_max_r: float = 1.3,
+    accept_reject: bool = False,
+    ar_backtrack_max: int = 0,
+    ar_backtrack_factor: float = 0.5,
+    ar_min_scale: float = 0.1,
+    ar_accept_tol: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, float] | tuple[np.ndarray, np.ndarray, float, int, int]:
     z = torch.from_numpy(z_np).to(device=device)
     if z.dtype != torch.complex64:
@@ -200,6 +211,11 @@ def run_unrolled(
     pscale_max_theta_cfg = float(pscale_max_theta)
     pscale_min_r_cfg = float(pscale_min_r)
     pscale_max_r_cfg = float(pscale_max_r)
+    accept_reject_cfg = bool(accept_reject)
+    ar_backtrack_max_cfg = int(ar_backtrack_max)
+    ar_backtrack_factor_cfg = float(ar_backtrack_factor)
+    ar_min_scale_cfg = float(ar_min_scale)
+    ar_accept_tol_cfg = float(ar_accept_tol)
     T_model = int(T)
     T_build = int(T)
     sd_to_load = None
@@ -226,6 +242,11 @@ def run_unrolled(
         pscale_max_theta_cfg = float(ckpt_args.get("pscale_max_theta", pscale_max_theta_cfg))
         pscale_min_r_cfg = float(ckpt_args.get("pscale_min_r", pscale_min_r_cfg))
         pscale_max_r_cfg = float(ckpt_args.get("pscale_max_r", pscale_max_r_cfg))
+        accept_reject_cfg = bool(int(ckpt_args.get("accept_reject", int(accept_reject_cfg))))
+        ar_backtrack_max_cfg = int(ckpt_args.get("ar_backtrack_max", ar_backtrack_max_cfg))
+        ar_backtrack_factor_cfg = float(ckpt_args.get("ar_backtrack_factor", ar_backtrack_factor_cfg))
+        ar_min_scale_cfg = float(ckpt_args.get("ar_min_scale", ar_min_scale_cfg))
+        ar_accept_tol_cfg = float(ckpt_args.get("ar_accept_tol", ar_accept_tol_cfg))
 
         if learnable:
             T_model = _infer_ckpt_T_model(sd, ckpt_args, T_fallback=T)
@@ -261,6 +282,11 @@ def run_unrolled(
         pscale_max_theta=pscale_max_theta_cfg,
         pscale_min_r=pscale_min_r_cfg,
         pscale_max_r=pscale_max_r_cfg,
+        accept_reject=accept_reject_cfg,
+        ar_backtrack_max=ar_backtrack_max_cfg,
+        ar_backtrack_factor=ar_backtrack_factor_cfg,
+        ar_min_scale=ar_min_scale_cfg,
+        ar_accept_tol=ar_accept_tol_cfg,
     ).to(device)
     if sd_to_load is not None:
         refiner.load_state_dict(sd_to_load, strict=True)
@@ -467,6 +493,11 @@ def main() -> None:
                 pscale_max_theta=float(args.pscale_max_theta),
                 pscale_min_r=float(args.pscale_min_r),
                 pscale_max_r=float(args.pscale_max_r),
+                accept_reject=bool(int(args.accept_reject)),
+                ar_backtrack_max=int(args.ar_backtrack_max),
+                ar_backtrack_factor=float(args.ar_backtrack_factor),
+                ar_min_scale=float(args.ar_min_scale),
+                ar_accept_tol=float(args.ar_accept_tol),
             )
             rmse_theta = rmse_np(angle_error_deg_np(th_u, theta_gt))
             rmse_r = rmse_np(r_u - r_gt)
@@ -522,6 +553,11 @@ def main() -> None:
                         pscale_max_theta=float(args.pscale_max_theta),
                         pscale_min_r=float(args.pscale_min_r),
                         pscale_max_r=float(args.pscale_max_r),
+                        accept_reject=bool(int(args.accept_reject)),
+                        ar_backtrack_max=int(args.ar_backtrack_max),
+                        ar_backtrack_factor=float(args.ar_backtrack_factor),
+                        ar_min_scale=float(args.ar_min_scale),
+                        ar_accept_tol=float(args.ar_accept_tol),
                     )
                     rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
                     rmse_r = rmse_np(r_ul - r_gt)
@@ -613,6 +649,11 @@ def main() -> None:
             pscale_max_theta=float(args.pscale_max_theta),
             pscale_min_r=float(args.pscale_min_r),
             pscale_max_r=float(args.pscale_max_r),
+            accept_reject=bool(int(args.accept_reject)),
+            ar_backtrack_max=int(args.ar_backtrack_max),
+            ar_backtrack_factor=float(args.ar_backtrack_factor),
+            ar_min_scale=float(args.ar_min_scale),
+            ar_accept_tol=float(args.ar_accept_tol),
         )
 
     for T_run in ablate_T:
@@ -777,6 +818,11 @@ def main() -> None:
                     pscale_max_theta=float(args.pscale_max_theta),
                     pscale_min_r=float(args.pscale_min_r),
                     pscale_max_r=float(args.pscale_max_r),
+                    accept_reject=bool(int(args.accept_reject)),
+                    ar_backtrack_max=int(args.ar_backtrack_max),
+                    ar_backtrack_factor=float(args.ar_backtrack_factor),
+                    ar_min_scale=float(args.ar_min_scale),
+                    ar_accept_tol=float(args.ar_accept_tol),
                 )
                 gr_csv.log(
                     {
@@ -833,6 +879,11 @@ def main() -> None:
                             pscale_max_theta=float(args.pscale_max_theta),
                             pscale_min_r=float(args.pscale_min_r),
                             pscale_max_r=float(args.pscale_max_r),
+                            accept_reject=bool(int(args.accept_reject)),
+                            ar_backtrack_max=int(args.ar_backtrack_max),
+                            ar_backtrack_factor=float(args.ar_backtrack_factor),
+                            ar_min_scale=float(args.ar_min_scale),
+                            ar_accept_tol=float(args.ar_accept_tol),
                         )
                         gr_csv.log(
                             {

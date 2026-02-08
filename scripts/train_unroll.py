@@ -155,6 +155,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_min_r", type=float, default=0.7)
     p.add_argument("--pscale_max_r", type=float, default=1.3)
     p.add_argument("--pscale_reg_w", type=float, default=1e-3)
+    # Monotone accept-reject / backtracking for each unroll step.
+    p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
+    p.add_argument("--ar_backtrack_max", type=int, default=0)
+    p.add_argument("--ar_backtrack_factor", type=float, default=0.5)
+    p.add_argument("--ar_min_scale", type=float, default=0.1)
+    p.add_argument("--ar_accept_tol", type=float, default=0.0)
     p.add_argument("--t_table_freeze_steps", type=int, default=2000)
     p.add_argument("--t_table_lr_mult", type=float, default=0.1)
     p.add_argument("--kd_warmup_steps", type=int, default=1500)
@@ -470,6 +476,11 @@ def main() -> None:
         pscale_max_theta=float(args.pscale_max_theta),
         pscale_min_r=float(args.pscale_min_r),
         pscale_max_r=float(args.pscale_max_r),
+        accept_reject=bool(int(args.accept_reject)),
+        ar_backtrack_max=int(args.ar_backtrack_max),
+        ar_backtrack_factor=float(args.ar_backtrack_factor),
+        ar_min_scale=float(args.ar_min_scale),
+        ar_accept_tol=float(args.ar_accept_tol),
     ).to(device)
 
     # Optimizer with optional separate param group for t_table.
@@ -938,6 +949,13 @@ def main() -> None:
                         "t_table_mean_r": float(tm[1].item()),
                         "t_table_std_theta": float(ts[0].item()),
                         "t_table_std_r": float(ts[1].item()),
+                    }
+                )
+            if "ar_accept_ratio" in dbg:
+                row.update(
+                    {
+                        "ar_accept_ratio": float(dbg["ar_accept_ratio"].detach().cpu().item()),
+                        "ar_scale_mean": float(dbg["ar_scale_mean"].detach().cpu().item()),
                     }
                 )
             logger.log(row)

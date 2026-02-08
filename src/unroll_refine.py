@@ -143,6 +143,11 @@ class Refiner(nn.Module):
         step_clip: float = 1e-1,
         delta_theta_clip_deg: float = 5.0,
         delta_r_clip_m: float = 200.0,
+        accept_reject: bool = False,
+        ar_backtrack_max: int = 0,
+        ar_backtrack_factor: float = 0.5,
+        ar_min_scale: float = 0.1,
+        ar_accept_tol: float = 0.0,
     ) -> None:
         super().__init__()
         self.cfg = cfg
@@ -216,6 +221,17 @@ class Refiner(nn.Module):
         self.step_clip = float(step_clip)
         self.delta_theta_clip_deg = float(delta_theta_clip_deg)
         self.delta_r_clip_m = float(delta_r_clip_m)
+        self.accept_reject = bool(accept_reject)
+        self.ar_backtrack_max = int(ar_backtrack_max)
+        self.ar_backtrack_factor = float(ar_backtrack_factor)
+        self.ar_min_scale = float(ar_min_scale)
+        self.ar_accept_tol = float(ar_accept_tol)
+        if self.ar_backtrack_max < 0:
+            raise ValueError("ar_backtrack_max must be >= 0")
+        if not (0.0 < self.ar_backtrack_factor < 1.0):
+            raise ValueError("ar_backtrack_factor must be in (0,1)")
+        if self.ar_min_scale <= 0.0:
+            raise ValueError("ar_min_scale must be > 0")
 
         a0 = torch.full((self.T,), float(init_alpha), dtype=torch.float32)
         l0 = torch.full((self.T,), float(init_lambda), dtype=torch.float32)
@@ -317,6 +333,8 @@ class Refiner(nn.Module):
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
+        ar_accept_ratio = []
+        ar_scale_mean = []
 
         with torch.enable_grad():
             for t in range(steps):
@@ -472,8 +490,6 @@ class Refiner(nn.Module):
                         scale_tr = torch.stack([scale_th, scale_rr], dim=-1).clamp(0.0, 1.0)
                         step_eff = step_eff * scale_tr
 
-                    u = u - step_eff
-
                     with torch.no_grad():
                         if pscale_sum is None:
                             pscale_sum = torch.zeros((2,), device=scale.device, dtype=torch.float32)
@@ -517,6 +533,46 @@ class Refiner(nn.Module):
                         scale_tr = torch.stack([scale_th, scale_rr], dim=-1).clamp(0.0, 1.0)
                         step_eff = step_eff * scale_tr
 
+                if self.accept_reject:
+                    base_obj = torch.nan_to_num(
+                        obj.detach(),
+                        nan=-1e30,
+                        posinf=1e30,
+                        neginf=-1e30,
+                    )
+                    B = int(u_prev.shape[0])
+                    accepted = torch.zeros((B,), device=u_prev.device, dtype=torch.bool)
+                    u_next = u_prev
+                    scale = torch.ones((B,), device=u_prev.device, dtype=u_prev.dtype)
+                    max_bt = int(self.ar_backtrack_max)
+
+                    for bt in range(max_bt + 1):
+                        remaining = ~accepted
+                        if not remaining.any().item():
+                            break
+                        scale_clamped = scale.clamp_min(float(self.ar_min_scale))
+                        u_try = u_prev - step_eff * scale_clamped.view(-1, 1)
+                        with torch.no_grad():
+                            theta_try, r_try = map_u_to_theta_r(u_try.detach(), self.box, r_box=self.r_box)
+                            obj_try = self._objective_value(theta_try, r_try, z, beta)
+                            obj_try = torch.nan_to_num(obj_try, nan=-1e30, posinf=1e30, neginf=-1e30)
+                            ok = remaining & (obj_try >= (base_obj - float(self.ar_accept_tol)))
+
+                        u_next = torch.where(ok.view(-1, 1), u_try, u_next)
+                        accepted = accepted | ok
+                        if bt < max_bt:
+                            scale = scale * float(self.ar_backtrack_factor)
+
+                    u = u_next
+                    with torch.no_grad():
+                        moved = torch.linalg.vector_norm((u - u_prev).detach().to(torch.float32), ord=2, dim=-1)
+                        full = torch.linalg.vector_norm(step_eff.detach().to(torch.float32), ord=2, dim=-1).clamp_min(
+                            1e-12
+                        )
+                        eff_scale = moved / full
+                        ar_accept_ratio.append(accepted.to(torch.float32).mean().detach())
+                        ar_scale_mean.append(eff_scale.mean().detach())
+                else:
                     u = u - step_eff
 
                 if return_trace:
@@ -553,6 +609,9 @@ class Refiner(nn.Module):
                 tbl = self.t_log_scale_table.detach().to(torch.float32)
                 debug["t_table_mean"] = tbl.mean(dim=0)
                 debug["t_table_std"] = tbl.std(dim=0, unbiased=False)
+        if self.accept_reject and len(ar_accept_ratio) > 0:
+            debug["ar_accept_ratio"] = torch.stack(ar_accept_ratio).mean()
+            debug["ar_scale_mean"] = torch.stack(ar_scale_mean).mean()
 
         if not return_trace:
             return theta_T, r_T, debug
