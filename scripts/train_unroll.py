@@ -53,6 +53,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--T", type=int, default=10)
+    # Training-time unroll policy: full uses T every step; uniform samples T_run in [train_T_min, T].
+    p.add_argument("--train_T_mode", type=str, default="full", choices=["full", "uniform"])
+    p.add_argument("--train_T_min", type=int, default=1)
     # Total optimization steps. If omitted, can be derived from --epochs * --steps_per_epoch (compat).
     p.add_argument("--steps", type=int, default=None)
     # Backward-compatible epoch-style interface (optional).
@@ -118,6 +121,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--w_theta", type=float, default=1.0)
     p.add_argument("--w_r", type=float, default=1.0)
     p.add_argument("--huber_delta", type=float, default=1.0)
+    # Optional prefix-consistent deep supervision over intermediate unroll states.
+    p.add_argument("--w_gt_prefix", type=float, default=0.0)
+    p.add_argument("--gt_prefix_t_weight", type=str, default="late", choices=["uniform", "late"])
+    # Optional SNR reweighting for GT supervision.
+    p.add_argument("--snr_weight_split_db", type=float, default=0.0)
+    p.add_argument("--snr_weight_hi", type=float, default=1.0)
+    p.add_argument("--snr_weight_lo", type=float, default=1.0)
     # Step-wise KD time weighting (alias for --kd_step_t_weight)
     p.add_argument("--kd_time_weight", type=str, default=None, choices=["uniform", "late"])
     # Optional debug trace dumping (off by default)
@@ -214,6 +224,118 @@ def gt_loss(
     return loss, loss_theta, loss_r
 
 
+def weighted_gt_loss(
+    theta_err_deg: torch.Tensor,
+    r_err_m: torch.Tensor,
+    *,
+    theta_scale: float,
+    r_scale: float,
+    w_theta: float,
+    w_r: float,
+    huber_delta: float,
+    sample_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    theta_n = theta_err_deg / float(theta_scale)
+    r_n = r_err_m / float(r_scale)
+    theta_term = torch.nn.functional.huber_loss(
+        theta_n.to(torch.float32),
+        torch.zeros_like(theta_n, dtype=torch.float32),
+        delta=float(huber_delta),
+        reduction="none",
+    )
+    r_term = torch.nn.functional.huber_loss(
+        r_n.to(torch.float32),
+        torch.zeros_like(r_n, dtype=torch.float32),
+        delta=float(huber_delta),
+        reduction="none",
+    )
+    if sample_weight is None:
+        loss_theta = theta_term.mean().to(theta_err_deg.dtype)
+        loss_r = r_term.mean().to(theta_err_deg.dtype)
+    else:
+        w = sample_weight.to(theta_term.dtype).reshape(-1)
+        den = w.sum().clamp_min(1e-12)
+        loss_theta = ((theta_term.reshape(-1) * w).sum() / den).to(theta_err_deg.dtype)
+        loss_r = ((r_term.reshape(-1) * w).sum() / den).to(theta_err_deg.dtype)
+    loss = float(w_theta) * loss_theta + float(w_r) * loss_r
+    return loss, loss_theta, loss_r
+
+
+def snr_sample_weight(
+    snr_db: torch.Tensor,
+    *,
+    split_db: float,
+    w_hi: float,
+    w_lo: float,
+) -> torch.Tensor:
+    return torch.where(
+        snr_db >= float(split_db),
+        torch.full_like(snr_db, float(w_hi)),
+        torch.full_like(snr_db, float(w_lo)),
+    )
+
+
+def prefix_gt_loss_from_trace(
+    trace: dict,
+    *,
+    refiner: Refiner,
+    theta_gt: torch.Tensor,
+    r_gt: torch.Tensor,
+    T_steps: int,
+    theta_scale: float,
+    r_scale: float,
+    w_theta: float,
+    w_r: float,
+    huber_delta: float,
+    t_weight_mode: str,
+    sample_weight: torch.Tensor | None = None,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if T_steps <= 0:
+        z = torch.tensor(0.0, device=device, dtype=theta_gt.dtype)
+        return z, z, z
+    u_pre = trace["u"]
+    if len(u_pre) < T_steps:
+        raise RuntimeError(f"Unexpected u trace length: len(u)={len(u_pre)} < T_steps={T_steps}")
+    u_states_all = torch.stack([*u_pre[:T_steps], trace["u_T"]], dim=0)  # (T+1,B,2)
+    batch = int(theta_gt.shape[0])
+    u_post = u_states_all[1:, :, :].reshape(T_steps * batch, 2)
+    th_flat, r_flat = map_u_to_theta_r(u_post, refiner.box, r_box=refiner.r_box)
+    th_pred = th_flat.view(T_steps, batch)
+    r_pred = r_flat.view(T_steps, batch)
+    theta_target = theta_gt.view(1, batch).expand(T_steps, batch)
+    r_target = r_gt.view(1, batch).expand(T_steps, batch)
+    e_th = angle_error_deg_torch(th_pred, theta_target)
+    e_r = r_pred - r_target
+    theta_n = e_th / float(theta_scale)
+    r_n = e_r / float(r_scale)
+    theta_term = torch.nn.functional.huber_loss(
+        theta_n.to(torch.float32),
+        torch.zeros_like(theta_n, dtype=torch.float32),
+        delta=float(huber_delta),
+        reduction="none",
+    )
+    r_term = torch.nn.functional.huber_loss(
+        r_n.to(torch.float32),
+        torch.zeros_like(r_n, dtype=torch.float32),
+        delta=float(huber_delta),
+        reduction="none",
+    )
+    if sample_weight is None:
+        loss_theta_step = theta_term.mean(dim=1)
+        loss_r_step = r_term.mean(dim=1)
+    else:
+        sw = sample_weight.to(theta_term.dtype).view(1, batch)
+        den = sw.sum().clamp_min(1e-12)
+        loss_theta_step = (theta_term * sw).sum(dim=1) / den
+        loss_r_step = (r_term * sw).sum(dim=1) / den
+    w_t = t_weights(T_steps, t_weight_mode, device=device).to(loss_theta_step.dtype)
+    loss_theta = (w_t * loss_theta_step).sum().to(theta_gt.dtype)
+    loss_r = (w_t * loss_r_step).sum().to(theta_gt.dtype)
+    loss = float(w_theta) * loss_theta + float(w_r) * loss_r
+    return loss, loss_theta, loss_r
+
+
 def masked_gt_loss(
     theta_err_deg: torch.Tensor,
     r_err_m: torch.Tensor,
@@ -287,6 +409,10 @@ def main() -> None:
         else:
             args.steps = 2000
     args.steps = int(args.steps)
+    if int(args.T) <= 0:
+        raise ValueError("--T must be positive for training")
+    if int(args.train_T_min) <= 0:
+        raise ValueError("--train_T_min must be positive")
 
     seed_all(args.seed)
 
@@ -402,6 +528,12 @@ def main() -> None:
         _, z, _ = synthesize_batch_torch(theta_gt, r_gt, snr_db, cfg)
 
         theta0, r0, _ = coarse.search(z)
+        t_full = int(args.T)
+        if str(args.train_T_mode) == "uniform":
+            t_min = max(1, min(int(args.train_T_min), t_full))
+            T_train = int(torch.randint(t_min, t_full + 1, (1,), device=device).item())
+        else:
+            T_train = int(t_full)
         pscale_step_norm = float(step - 1) / float(max(int(args.steps) - 1, 1))
         kd_time_weight = str(args.kd_time_weight) if args.kd_time_weight is not None else str(args.kd_step_t_weight)
         need_kd_step = (
@@ -410,21 +542,26 @@ def main() -> None:
             and float(args.w_kd_step) > 0.0
             and (float(args.w_kd_step_theta) > 0.0 or float(args.w_kd_step_r) > 0.0)
         )
+        need_prefix_gt = float(args.w_gt_prefix) > 0.0
+        need_trace_grad = bool(need_kd_step or need_prefix_gt)
         dump_every = int(args.dump_trace_every)
         dump_this_step = dump_every > 0 and (step % dump_every == 0)
-        want_trace = bool(need_kd_step or dump_this_step)
+        want_trace = bool(need_kd_step or need_prefix_gt or dump_this_step)
         if want_trace:
             theta_hat, r_hat, dbg, trace = refiner(
                 z,
                 theta0,
                 r0,
+                T_run=T_train,
                 beta=beta,
                 return_trace=True,
-                trace_detach=not bool(need_kd_step),
+                trace_detach=not need_trace_grad,
                 pscale_step_norm=pscale_step_norm,
             )
         else:
-            theta_hat, r_hat, dbg = refiner(z, theta0, r0, beta=beta, pscale_step_norm=pscale_step_norm)
+            theta_hat, r_hat, dbg = refiner(
+                z, theta0, r0, T_run=T_train, beta=beta, pscale_step_norm=pscale_step_norm
+            )
             trace = None
 
         theta_err = angle_error_deg_torch(theta_hat, theta_gt)
@@ -453,7 +590,7 @@ def main() -> None:
 
                 th_nm = np.zeros((idx.numel(),), dtype=np.float32)
                 r_nm = np.zeros((idx.numel(),), dtype=np.float32)
-                T = int(args.T)
+                T = int(T_train)
                 th_nm_hist = np.zeros((idx.numel(), T), dtype=np.float32) if need_kd_step else None
                 r_nm_hist = np.zeros((idx.numel(), T), dtype=np.float32) if need_kd_step else None
                 for j in range(idx.numel()):
@@ -561,7 +698,7 @@ def main() -> None:
             r_gt_dump = r_gt[dump_idx].detach().cpu().numpy().astype(np.float32)
             snr_dump = snr_db[dump_idx].detach().cpu().numpy().astype(np.float32)
 
-            T = int(args.T)
+            T = int(T_train)
             th_nm_hist_dump = np.zeros((dump_n, T), dtype=np.float32)
             r_nm_hist_dump = np.zeros((dump_n, T), dtype=np.float32)
             for j in range(dump_n):
@@ -604,7 +741,7 @@ def main() -> None:
                 snr_db=snr_dump,
             )
 
-        loss_gt, loss_gt_theta, loss_gt_r = gt_loss(
+        loss_gt_raw, loss_gt_theta_raw, loss_gt_r_raw = gt_loss(
             theta_err,
             r_err,
             theta_scale=float(args.theta_scale),
@@ -613,6 +750,42 @@ def main() -> None:
             w_r=float(args.w_r),
             huber_delta=float(args.huber_delta),
         )
+        sample_w = snr_sample_weight(
+            snr_db,
+            split_db=float(args.snr_weight_split_db),
+            w_hi=float(args.snr_weight_hi),
+            w_lo=float(args.snr_weight_lo),
+        )
+        loss_gt, loss_gt_theta, loss_gt_r = weighted_gt_loss(
+            theta_err,
+            r_err,
+            theta_scale=float(args.theta_scale),
+            r_scale=float(args.r_scale),
+            w_theta=float(args.w_theta),
+            w_r=float(args.w_r),
+            huber_delta=float(args.huber_delta),
+            sample_weight=sample_w,
+        )
+        if need_prefix_gt and trace is not None:
+            loss_gt_prefix, loss_gt_prefix_theta, loss_gt_prefix_r = prefix_gt_loss_from_trace(
+                trace,
+                refiner=refiner,
+                theta_gt=theta_gt,
+                r_gt=r_gt,
+                T_steps=int(T_train),
+                theta_scale=float(args.theta_scale),
+                r_scale=float(args.r_scale),
+                w_theta=float(args.w_theta),
+                w_r=float(args.w_r),
+                huber_delta=float(args.huber_delta),
+                t_weight_mode=str(args.gt_prefix_t_weight),
+                sample_weight=sample_w,
+                device=device,
+            )
+        else:
+            loss_gt_prefix = torch.tensor(0.0, device=device)
+            loss_gt_prefix_theta = torch.tensor(0.0, device=device)
+            loss_gt_prefix_r = torch.tensor(0.0, device=device)
         snr_ge0 = snr_db >= 0.0
         loss_gt_snr_ge0 = masked_gt_loss(
             theta_err,
@@ -644,7 +817,7 @@ def main() -> None:
         nm_target_raw = -ll_mean
         nm_target_used = nm_target_raw
 
-        loss_gt_term = gt_lambda_eff_used * loss_gt
+        loss_gt_term = gt_lambda_eff_used * loss_gt + float(args.w_gt_prefix) * loss_gt_prefix
         loss_nm_term = float(nm_lambda_eff_used) * nm_target_used
         loss_kd_term = float(args.w_nm) * loss_nm + loss_kd_step
         reg_term = loss_pscale_reg
@@ -691,6 +864,8 @@ def main() -> None:
         if step % args.log_interval == 0:
             row = {
                 "step": step,
+                "T_run_train": int(T_train),
+                "train_T_mode": str(args.train_T_mode),
                 "loss": float(loss.item()),
                 "gt_lambda_eff_used": float(gt_lambda_eff_used),
                 "nm_target_raw": float(nm_target_raw.detach().item()),
@@ -713,8 +888,15 @@ def main() -> None:
                 "grad_clip": float(args.grad_clip),
                 "loss_nm": float(loss_nm.item()),
                 "loss_gt": float(loss_gt.item()),
+                "loss_gt_raw": float(loss_gt_raw.item()),
                 "loss_gt_theta": float(loss_gt_theta.item()),
                 "loss_gt_r": float(loss_gt_r.item()),
+                "loss_gt_theta_raw": float(loss_gt_theta_raw.item()),
+                "loss_gt_r_raw": float(loss_gt_r_raw.item()),
+                "loss_gt_prefix": float(loss_gt_prefix.item()),
+                "loss_gt_prefix_theta": float(loss_gt_prefix_theta.item()),
+                "loss_gt_prefix_r": float(loss_gt_prefix_r.item()),
+                "w_gt_prefix": float(args.w_gt_prefix),
                 "kd_active_ratio": float(kd_active_ratio),
                 "loss_gt_snr_ge0": float(loss_gt_snr_ge0.item()),
                 "loss_gt_snr_lt0": float(loss_gt_snr_lt0.item()),
@@ -728,6 +910,10 @@ def main() -> None:
                 "nm_lambda_eff": float(nm_lambda_eff_used),
                 "nm_lambda_eff_raw": float(nm_lambda_eff_raw),
                 "nm_lambda_eff_used": float(nm_lambda_eff_used),
+                "snr_weight_mean": float(sample_w.mean().detach().item()),
+                "snr_weight_hi": float(args.snr_weight_hi),
+                "snr_weight_lo": float(args.snr_weight_lo),
+                "snr_weight_split_db": float(args.snr_weight_split_db),
             }
             if "pscale_scale_mean" in dbg:
                 m = dbg["pscale_scale_mean"].detach().cpu().to(torch.float32)
