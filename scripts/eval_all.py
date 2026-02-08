@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--theta_step", type=float, default=1.0)
     p.add_argument("--r_step", type=float, default=100.0)
     p.add_argument("--nm_maxiter", type=int, default=60)
+    # Optional 2-stage hybrid: learned unroll + tiny NM tail (for Pareto probing).
+    p.add_argument("--learned_nm_tail_iters", type=int, default=0)
+    p.add_argument("--learned_nm_tail_snr_min", type=float, default=0.0)
     p.add_argument("--ckpt_path", type=str, default="")
     p.add_argument("--sanitize_ckpt", action="store_true")
     p.add_argument("--full", action="store_true")
@@ -513,8 +516,16 @@ def main() -> None:
             )
 
         # 4) grid + unrolled (learned) GPU batch
+        learned_ok = False
+        learned_skip_note = ""
+        th_ul = None
+        r_ul = None
+        ms_ul = None
+        T_model_ul = None
+        T_run_ul = None
         if args.ckpt_path:
             if int(T_resolved) <= 0:
+                learned_skip_note = f"skip: T_run={int(T_resolved)} (no unroll steps)"
                 csv.log(
                     {
                         "snr_db": snr_db,
@@ -522,7 +533,7 @@ def main() -> None:
                         "rmse_theta_deg": "",
                         "rmse_r_m": "",
                         "ms_per_sample": "",
-                        "notes": f"skip: T_run={int(T_resolved)} (no unroll steps)",
+                        "notes": learned_skip_note,
                     }
                 )
             else:
@@ -559,6 +570,7 @@ def main() -> None:
                         ar_min_scale=float(args.ar_min_scale),
                         ar_accept_tol=float(args.ar_accept_tol),
                     )
+                    learned_ok = True
                     rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
                     rmse_r = rmse_np(r_ul - r_gt)
                     csv.log(
@@ -572,6 +584,7 @@ def main() -> None:
                         }
                     )
                 except RuntimeError as e:
+                    learned_skip_note = f"skip ({str(e)})"
                     csv.log(
                         {
                             "snr_db": snr_db,
@@ -579,10 +592,11 @@ def main() -> None:
                             "rmse_theta_deg": "",
                             "rmse_r_m": "",
                             "ms_per_sample": "",
-                            "notes": f"skip ({str(e)})",
+                            "notes": learned_skip_note,
                         }
                     )
         else:
+            learned_skip_note = "skip (no --ckpt_path)"
             csv.log(
                 {
                     "snr_db": snr_db,
@@ -590,9 +604,77 @@ def main() -> None:
                     "rmse_theta_deg": "",
                     "rmse_r_m": "",
                     "ms_per_sample": "",
-                    "notes": "skip (no --ckpt_path)",
+                    "notes": learned_skip_note,
                 }
             )
+
+        # 5) optional learned + tiny NM tail (CPU), for speed-accuracy Pareto probing.
+        tail_iters = int(args.learned_nm_tail_iters)
+        if tail_iters > 0:
+            method_tail = f"grid_unroll_learned_nm{tail_iters}"
+            if not args.ckpt_path:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": "skip (no --ckpt_path)",
+                    }
+                )
+            elif snr_db < float(args.learned_nm_tail_snr_min):
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip (snr_db={snr_db} < learned_nm_tail_snr_min={float(args.learned_nm_tail_snr_min)})",
+                    }
+                )
+            elif not learned_ok:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip (learned failed: {learned_skip_note})",
+                    }
+                )
+            else:
+                th_tail = np.zeros_like(theta_gt)
+                r_tail = np.zeros_like(r_gt)
+                with Timer() as t_tail:
+                    for i in range(args.num_samples):
+                        res = refine_nelder_mead(
+                            z[i],
+                            float(th_ul[i]),
+                            float(r_ul[i]),
+                            cfg,
+                            theta_range=(box.theta_min, box.theta_max),
+                            r_range=(box.r_min, box.r_max),
+                            maxiter=tail_iters,
+                        )
+                        th_tail[i] = res.theta_deg
+                        r_tail[i] = res.r_m
+                nm_tail_ms = ms_per_sample(t_tail.dt, args.num_samples)
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail,
+                        "rmse_theta_deg": rmse_np(angle_error_deg_np(th_tail, theta_gt)),
+                        "rmse_r_m": rmse_np(r_tail - r_gt),
+                        "ms_per_sample": float(ms_ul) + float(nm_tail_ms),
+                        "notes": (
+                            f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}; "
+                            f"nm_tail_iters={tail_iters}; nm_tail_only_ms={nm_tail_ms:.3f}"
+                        ),
+                    }
+                )
 
         print(f"SNR={snr_db} done")
 
