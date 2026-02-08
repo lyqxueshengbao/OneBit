@@ -101,21 +101,46 @@ def _sanitize_refiner_alpha_lambda(refiner: Refiner, *, init_alpha: float = 2e-2
             t.data = torch.where(torch.isfinite(t.data), t.data, raw0)
 
 
-def _infer_refiner_T_model_from_sd(sd: dict, *, T_fallback: int, learnable: bool) -> int:
-    t_model = int(T_fallback)
-    if not learnable:
-        return t_model
-    for name in (
+def _infer_ckpt_T_model(sd: dict, ckpt_args: dict, *, T_fallback: int) -> int:
+    t_arg = ckpt_args.get("T", None)
+    if t_arg is not None:
+        return int(t_arg)
+    alpha = sd.get("alpha_theta_raw", None)
+    if torch.is_tensor(alpha) and alpha.ndim >= 1:
+        return int(alpha.shape[0])
+    return int(T_fallback)
+
+
+def slice_state_dict_for_T(sd: dict, T_run: int, T_model: int) -> dict:
+    t_run = int(T_run)
+    t_model = int(T_model)
+    out: dict = {}
+    # Explicit per-step tensors plus shape-based fallback for future per-step keys.
+    stepwise_names = {
         "alpha_theta_raw",
         "alpha_r_raw",
         "lambda_theta_raw",
         "lambda_r_raw",
         "t_log_scale_table",
-    ):
-        tensor = sd.get(name, None)
-        if torch.is_tensor(tensor):
-            return int(tensor.numel())
-    return t_model
+    }
+    for name, value in sd.items():
+        if not torch.is_tensor(value):
+            out[name] = value
+            continue
+        should_slice = name in stepwise_names or (
+            value.ndim >= 1
+            and int(value.shape[0]) == t_model
+            and any(token in name for token in ("alpha", "lambda", "t_log_scale", "step"))
+        )
+        if should_slice:
+            if value.ndim < 1 or int(value.shape[0]) < t_run:
+                raise RuntimeError(
+                    f"Cannot slice ckpt tensor '{name}' to T_run={t_run}: shape={tuple(value.shape)}"
+                )
+            out[name] = value[:t_run].clone()
+        else:
+            out[name] = value
+    return out
 
 
 def run_unrolled(
@@ -149,6 +174,7 @@ def run_unrolled(
     z = torch.from_numpy(z_np).to(device=device)
     if z.dtype != torch.complex64:
         z = z.to(torch.complex64)
+    requested_t_run = int(T if T_run is None else T_run)
 
     coarse = CoarseSearcherTorch(
         cfg,
@@ -159,81 +185,85 @@ def run_unrolled(
         device=device,
     )
 
-    refiner = Refiner(
-        cfg,
-        T=T,
-        box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
-        learnable=learnable,
-        r_precond_mul=1.0,
-        r_precond_pow=1.0,
-        r_precond_learnable=False,
-        use_pscale=bool(use_pscale),
-        pscale_hidden=int(pscale_hidden),
-        pscale_detach_step=bool(pscale_detach_step),
-        pscale_logrange=float(pscale_logrange),
-        pscale_amp=float(pscale_amp),
-        pscale_input=str(pscale_input),
-        use_t_table=bool(use_t_table),
-        t_table_init=float(t_table_init),
-        pscale_min_theta=float(pscale_min_theta),
-        pscale_max_theta=float(pscale_max_theta),
-        pscale_min_r=float(pscale_min_r),
-        pscale_max_r=float(pscale_max_r),
-    ).to(device)
+    r_precond_mul = 1.0
+    r_precond_pow = 1.0
+    r_precond_learnable = False
+    use_pscale_cfg = bool(use_pscale)
+    pscale_hidden_cfg = int(pscale_hidden)
+    pscale_detach_step_cfg = bool(pscale_detach_step)
+    pscale_logrange_cfg = float(pscale_logrange)
+    pscale_amp_cfg = float(pscale_amp)
+    pscale_input_cfg = str(pscale_input)
+    use_t_table_cfg = bool(use_t_table)
+    t_table_init_cfg = float(t_table_init)
+    pscale_min_theta_cfg = float(pscale_min_theta)
+    pscale_max_theta_cfg = float(pscale_max_theta)
+    pscale_min_r_cfg = float(pscale_min_r)
+    pscale_max_r_cfg = float(pscale_max_r)
     T_model = int(T)
+    T_build = int(T)
+    sd_to_load = None
+
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device)
         sd = ckpt["state_dict"]
         ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
-        T_model = _infer_refiner_T_model_from_sd(sd, T_fallback=T, learnable=learnable)
+
         r_precond_mul = float(ckpt_args.get("r_precond_mul", 1.0))
         r_precond_pow = float(ckpt_args.get("r_precond_pow", 1.0))
         r_precond_learnable = bool("r_precond_mul" in sd)
-        use_pscale_ckpt = bool(int(ckpt_args.get("use_pscale", 0))) or any(
+        use_pscale_cfg = bool(int(ckpt_args.get("use_pscale", 0))) or any(
             str(k).startswith("pscale_mlp.") for k in sd.keys()
         )
-        use_t_table_ckpt = bool(int(ckpt_args.get("use_t_table", 0))) or ("t_log_scale_table" in sd)
-        pscale_hidden_ckpt = int(ckpt_args.get("pscale_hidden", 32))
-        pscale_detach_step_ckpt = bool(int(ckpt_args.get("pscale_detach_step", 1)))
-        pscale_logrange_ckpt = float(ckpt_args.get("pscale_logrange", 6.9))
-        pscale_amp_ckpt = float(ckpt_args.get("pscale_amp", 1.0))
-        pscale_input_ckpt = str(ckpt_args.get("pscale_input", pscale_input))
-        t_table_init_ckpt = float(ckpt_args.get("t_table_init", 0.0))
-        pscale_min_theta_ckpt = float(ckpt_args.get("pscale_min_theta", pscale_min_theta))
-        pscale_max_theta_ckpt = float(ckpt_args.get("pscale_max_theta", pscale_max_theta))
-        pscale_min_r_ckpt = float(ckpt_args.get("pscale_min_r", pscale_min_r))
-        pscale_max_r_ckpt = float(ckpt_args.get("pscale_max_r", pscale_max_r))
+        use_t_table_cfg = bool(int(ckpt_args.get("use_t_table", 0))) or ("t_log_scale_table" in sd)
+        pscale_hidden_cfg = int(ckpt_args.get("pscale_hidden", 32))
+        pscale_detach_step_cfg = bool(int(ckpt_args.get("pscale_detach_step", 1)))
+        pscale_logrange_cfg = float(ckpt_args.get("pscale_logrange", 6.9))
+        pscale_amp_cfg = float(ckpt_args.get("pscale_amp", 1.0))
+        pscale_input_cfg = str(ckpt_args.get("pscale_input", pscale_input_cfg))
+        t_table_init_cfg = float(ckpt_args.get("t_table_init", 0.0))
+        pscale_min_theta_cfg = float(ckpt_args.get("pscale_min_theta", pscale_min_theta_cfg))
+        pscale_max_theta_cfg = float(ckpt_args.get("pscale_max_theta", pscale_max_theta_cfg))
+        pscale_min_r_cfg = float(ckpt_args.get("pscale_min_r", pscale_min_r_cfg))
+        pscale_max_r_cfg = float(ckpt_args.get("pscale_max_r", pscale_max_r_cfg))
 
-        refiner = Refiner(
-            cfg,
-            T=T_model,
-            box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
-            learnable=learnable,
-            r_precond_mul=r_precond_mul,
-            r_precond_pow=r_precond_pow,
-            r_precond_learnable=r_precond_learnable,
-            use_pscale=use_pscale_ckpt,
-            pscale_hidden=pscale_hidden_ckpt,
-            pscale_detach_step=pscale_detach_step_ckpt,
-            pscale_logrange=pscale_logrange_ckpt,
-            pscale_amp=pscale_amp_ckpt,
-            pscale_input=pscale_input_ckpt,
-            use_t_table=use_t_table_ckpt,
-            t_table_init=t_table_init_ckpt,
-            pscale_min_theta=pscale_min_theta_ckpt,
-            pscale_max_theta=pscale_max_theta_ckpt,
-            pscale_min_r=pscale_min_r_ckpt,
-            pscale_max_r=pscale_max_r_ckpt,
-        ).to(device)
-        if "t_log_scale_table" in sd and sd["t_log_scale_table"].shape[0] != int(T_model):
-            old = sd["t_log_scale_table"]
-            new = torch.zeros((int(T_model), 2), dtype=old.dtype, device=old.device)
-            n = min(int(T_model), int(old.shape[0]))
-            new[:n] = old[:n]
-            sd = dict(sd)
-            sd["t_log_scale_table"] = new
-        # Reload after rebuilding the module.
-        refiner.load_state_dict(sd, strict=True)
+        if learnable:
+            T_model = _infer_ckpt_T_model(sd, ckpt_args, T_fallback=T)
+            if requested_t_run > T_model:
+                raise RuntimeError(
+                    f"T_run={requested_t_run} > T_model={T_model} in ckpt; please eval with --T <= T_model"
+                )
+            if requested_t_run <= 0:
+                raise RuntimeError(f"T_run={requested_t_run} (no unroll steps)")
+            T_build = int(requested_t_run)
+            sd_to_load = slice_state_dict_for_T(sd, T_build, T_model)
+        else:
+            T_model = int(T_build)
+            sd_to_load = dict(sd)
+
+    refiner = Refiner(
+        cfg,
+        T=T_build,
+        box=Box(box.theta_min, box.theta_max, box.r_min, box.r_max),
+        learnable=learnable,
+        r_precond_mul=r_precond_mul,
+        r_precond_pow=r_precond_pow,
+        r_precond_learnable=r_precond_learnable,
+        use_pscale=use_pscale_cfg,
+        pscale_hidden=pscale_hidden_cfg,
+        pscale_detach_step=pscale_detach_step_cfg,
+        pscale_logrange=pscale_logrange_cfg,
+        pscale_amp=pscale_amp_cfg,
+        pscale_input=pscale_input_cfg,
+        use_t_table=use_t_table_cfg,
+        t_table_init=t_table_init_cfg,
+        pscale_min_theta=pscale_min_theta_cfg,
+        pscale_max_theta=pscale_max_theta_cfg,
+        pscale_min_r=pscale_min_r_cfg,
+        pscale_max_r=pscale_max_r_cfg,
+    ).to(device)
+    if sd_to_load is not None:
+        refiner.load_state_dict(sd_to_load, strict=True)
         bad = _nonfinite_module_tensors(refiner)
         if bad:
             if sanitize_ckpt:
@@ -245,7 +275,7 @@ def run_unrolled(
             else:
                 raise RuntimeError(f"Checkpoint has non-finite tensors: {bad}")
     refiner.eval()
-    T_run_eff = int(T_model if T_run is None else T_run)
+    T_run_eff = int(requested_t_run)
     T_run_eff = max(0, min(T_run_eff, int(T_model)))
 
     n = z.shape[0]
@@ -400,87 +430,60 @@ def main() -> None:
         )
 
         # 3) grid + unrolled (fixed) GPU batch
-        th_u, r_u, ms_u = run_unrolled(
-            z,
-            cfg,
-            box,
-            device=device,
-            theta_step=args.theta_step,
-            r_step=args.r_step,
-            T=T_resolved,
-            ckpt_path="",
-            sanitize_ckpt=False,
-            learnable=False,
-            batch_size=args.batch_size,
-            use_pscale=bool(int(args.use_pscale)),
-            pscale_hidden=int(args.pscale_hidden),
-            pscale_detach_step=bool(int(args.pscale_detach_step)),
-            pscale_logrange=float(args.pscale_logrange),
-            pscale_amp=float(args.pscale_amp),
-            pscale_input=str(args.pscale_input),
-            use_t_table=bool(int(args.use_t_table)),
-            t_table_init=float(args.t_table_init),
-            pscale_min_theta=float(args.pscale_min_theta),
-            pscale_max_theta=float(args.pscale_max_theta),
-            pscale_min_r=float(args.pscale_min_r),
-            pscale_max_r=float(args.pscale_max_r),
-        )
-        rmse_theta = rmse_np(angle_error_deg_np(th_u, theta_gt))
-        rmse_r = rmse_np(r_u - r_gt)
-        csv.log(
-            {
-                "snr_db": snr_db,
-                "method": "grid_unroll_fixed",
-                "rmse_theta_deg": rmse_theta,
-                "rmse_r_m": rmse_r,
-                "ms_per_sample": ms_u,
-                "notes": f"device={device.type}",
-            }
-        )
+        if int(T_resolved) <= 0:
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "grid_unroll_fixed",
+                    "rmse_theta_deg": "",
+                    "rmse_r_m": "",
+                    "ms_per_sample": "",
+                    "notes": f"skip: T_run={int(T_resolved)} (no unroll steps)",
+                }
+            )
+        else:
+            th_u, r_u, ms_u = run_unrolled(
+                z,
+                cfg,
+                box,
+                device=device,
+                theta_step=args.theta_step,
+                r_step=args.r_step,
+                T=T_resolved,
+                ckpt_path="",
+                sanitize_ckpt=False,
+                learnable=False,
+                T_run=T_resolved,
+                batch_size=args.batch_size,
+                use_pscale=bool(int(args.use_pscale)),
+                pscale_hidden=int(args.pscale_hidden),
+                pscale_detach_step=bool(int(args.pscale_detach_step)),
+                pscale_logrange=float(args.pscale_logrange),
+                pscale_amp=float(args.pscale_amp),
+                pscale_input=str(args.pscale_input),
+                use_t_table=bool(int(args.use_t_table)),
+                t_table_init=float(args.t_table_init),
+                pscale_min_theta=float(args.pscale_min_theta),
+                pscale_max_theta=float(args.pscale_max_theta),
+                pscale_min_r=float(args.pscale_min_r),
+                pscale_max_r=float(args.pscale_max_r),
+            )
+            rmse_theta = rmse_np(angle_error_deg_np(th_u, theta_gt))
+            rmse_r = rmse_np(r_u - r_gt)
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "grid_unroll_fixed",
+                    "rmse_theta_deg": rmse_theta,
+                    "rmse_r_m": rmse_r,
+                    "ms_per_sample": ms_u,
+                    "notes": f"device={device.type}; T_run={int(T_resolved)}",
+                }
+            )
 
         # 4) grid + unrolled (learned) GPU batch
         if args.ckpt_path:
-            try:
-                th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
-                    z,
-                    cfg,
-                    box,
-                    device=device,
-                    theta_step=args.theta_step,
-                    r_step=args.r_step,
-                    T=T_resolved,
-                    ckpt_path=args.ckpt_path,
-                    sanitize_ckpt=bool(args.sanitize_ckpt),
-                    learnable=True,
-                    T_run=T_resolved,
-                    return_meta=True,
-                    batch_size=args.batch_size,
-                    use_pscale=bool(int(args.use_pscale)),
-                    pscale_hidden=int(args.pscale_hidden),
-                    pscale_detach_step=bool(int(args.pscale_detach_step)),
-                    pscale_logrange=float(args.pscale_logrange),
-                    pscale_amp=float(args.pscale_amp),
-                    pscale_input=str(args.pscale_input),
-                    use_t_table=bool(int(args.use_t_table)),
-                    t_table_init=float(args.t_table_init),
-                    pscale_min_theta=float(args.pscale_min_theta),
-                    pscale_max_theta=float(args.pscale_max_theta),
-                    pscale_min_r=float(args.pscale_min_r),
-                    pscale_max_r=float(args.pscale_max_r),
-                )
-                rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
-                rmse_r = rmse_np(r_ul - r_gt)
-                csv.log(
-                    {
-                        "snr_db": snr_db,
-                        "method": "grid_unroll_learned",
-                        "rmse_theta_deg": rmse_theta,
-                        "rmse_r_m": rmse_r,
-                        "ms_per_sample": ms_ul,
-                        "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
-                    }
-                )
-            except RuntimeError as e:
+            if int(T_resolved) <= 0:
                 csv.log(
                     {
                         "snr_db": snr_db,
@@ -488,9 +491,61 @@ def main() -> None:
                         "rmse_theta_deg": "",
                         "rmse_r_m": "",
                         "ms_per_sample": "",
-                        "notes": f"skip ({str(e)})",
+                        "notes": f"skip: T_run={int(T_resolved)} (no unroll steps)",
                     }
                 )
+            else:
+                try:
+                    th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
+                        z,
+                        cfg,
+                        box,
+                        device=device,
+                        theta_step=args.theta_step,
+                        r_step=args.r_step,
+                        T=T_resolved,
+                        ckpt_path=args.ckpt_path,
+                        sanitize_ckpt=bool(args.sanitize_ckpt),
+                        learnable=True,
+                        T_run=T_resolved,
+                        return_meta=True,
+                        batch_size=args.batch_size,
+                        use_pscale=bool(int(args.use_pscale)),
+                        pscale_hidden=int(args.pscale_hidden),
+                        pscale_detach_step=bool(int(args.pscale_detach_step)),
+                        pscale_logrange=float(args.pscale_logrange),
+                        pscale_amp=float(args.pscale_amp),
+                        pscale_input=str(args.pscale_input),
+                        use_t_table=bool(int(args.use_t_table)),
+                        t_table_init=float(args.t_table_init),
+                        pscale_min_theta=float(args.pscale_min_theta),
+                        pscale_max_theta=float(args.pscale_max_theta),
+                        pscale_min_r=float(args.pscale_min_r),
+                        pscale_max_r=float(args.pscale_max_r),
+                    )
+                    rmse_theta = rmse_np(angle_error_deg_np(th_ul, theta_gt))
+                    rmse_r = rmse_np(r_ul - r_gt)
+                    csv.log(
+                        {
+                            "snr_db": snr_db,
+                            "method": "grid_unroll_learned",
+                            "rmse_theta_deg": rmse_theta,
+                            "rmse_r_m": rmse_r,
+                            "ms_per_sample": ms_ul,
+                            "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
+                        }
+                    )
+                except RuntimeError as e:
+                    csv.log(
+                        {
+                            "snr_db": snr_db,
+                            "method": "grid_unroll_learned",
+                            "rmse_theta_deg": "",
+                            "rmse_r_m": "",
+                            "ms_per_sample": "",
+                            "notes": f"skip ({str(e)})",
+                        }
+                    )
         else:
             csv.log(
                 {
@@ -683,86 +738,61 @@ def main() -> None:
             )
 
             # unrolled fixed (GPU batch) with this grid
-            th_u, r_u, ms_u = run_unrolled(
-                z[:ab_n],
-                cfg,
-                box,
-                device=device,
-                theta_step=th_step,
-                r_step=rr_step,
-                T=T_resolved,
-                ckpt_path="",
-                sanitize_ckpt=False,
-                learnable=False,
-                batch_size=args.batch_size,
-                use_pscale=bool(int(args.use_pscale)),
-                pscale_hidden=int(args.pscale_hidden),
-                pscale_detach_step=bool(int(args.pscale_detach_step)),
-                pscale_logrange=float(args.pscale_logrange),
-                pscale_amp=float(args.pscale_amp),
-                pscale_input=str(args.pscale_input),
-                use_t_table=bool(int(args.use_t_table)),
-                t_table_init=float(args.t_table_init),
-                pscale_min_theta=float(args.pscale_min_theta),
-                pscale_max_theta=float(args.pscale_max_theta),
-                pscale_min_r=float(args.pscale_min_r),
-                pscale_max_r=float(args.pscale_max_r),
-            )
-            gr_csv.log(
-                {
-                    "snr_db": ab_snr,
-                    "theta_step": th_step,
-                    "r_step": rr_step,
-                    "method": "grid_unroll_fixed",
-                    "rmse_theta_deg": rmse_np(angle_error_deg_np(th_u, theta_gt)),
-                    "rmse_r_m": rmse_np(r_u - r_gt),
-                    "ms_per_sample": ms_u,
-                    "notes": f"device={device.type}",
-                }
-            )
+            if int(T_resolved) <= 0:
+                gr_csv.log(
+                    {
+                        "snr_db": ab_snr,
+                        "theta_step": th_step,
+                        "r_step": rr_step,
+                        "method": "grid_unroll_fixed",
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip: T_run={int(T_resolved)} (no unroll steps)",
+                    }
+                )
+            else:
+                th_u, r_u, ms_u = run_unrolled(
+                    z[:ab_n],
+                    cfg,
+                    box,
+                    device=device,
+                    theta_step=th_step,
+                    r_step=rr_step,
+                    T=T_resolved,
+                    ckpt_path="",
+                    sanitize_ckpt=False,
+                    learnable=False,
+                    T_run=T_resolved,
+                    batch_size=args.batch_size,
+                    use_pscale=bool(int(args.use_pscale)),
+                    pscale_hidden=int(args.pscale_hidden),
+                    pscale_detach_step=bool(int(args.pscale_detach_step)),
+                    pscale_logrange=float(args.pscale_logrange),
+                    pscale_amp=float(args.pscale_amp),
+                    pscale_input=str(args.pscale_input),
+                    use_t_table=bool(int(args.use_t_table)),
+                    t_table_init=float(args.t_table_init),
+                    pscale_min_theta=float(args.pscale_min_theta),
+                    pscale_max_theta=float(args.pscale_max_theta),
+                    pscale_min_r=float(args.pscale_min_r),
+                    pscale_max_r=float(args.pscale_max_r),
+                )
+                gr_csv.log(
+                    {
+                        "snr_db": ab_snr,
+                        "theta_step": th_step,
+                        "r_step": rr_step,
+                        "method": "grid_unroll_fixed",
+                        "rmse_theta_deg": rmse_np(angle_error_deg_np(th_u, theta_gt)),
+                        "rmse_r_m": rmse_np(r_u - r_gt),
+                        "ms_per_sample": ms_u,
+                        "notes": f"device={device.type}; T_run={int(T_resolved)}",
+                    }
+                )
 
             if args.ckpt_path:
-                try:
-                    th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
-                        z[:ab_n],
-                        cfg,
-                        box,
-                        device=device,
-                        theta_step=th_step,
-                        r_step=rr_step,
-                        T=T_resolved,
-                        ckpt_path=args.ckpt_path,
-                        sanitize_ckpt=bool(args.sanitize_ckpt),
-                        learnable=True,
-                        T_run=T_resolved,
-                        return_meta=True,
-                        batch_size=args.batch_size,
-                        use_pscale=bool(int(args.use_pscale)),
-                        pscale_hidden=int(args.pscale_hidden),
-                        pscale_detach_step=bool(int(args.pscale_detach_step)),
-                        pscale_logrange=float(args.pscale_logrange),
-                        pscale_amp=float(args.pscale_amp),
-                        pscale_input=str(args.pscale_input),
-                        use_t_table=bool(int(args.use_t_table)),
-                        t_table_init=float(args.t_table_init),
-                        pscale_min_theta=float(args.pscale_min_theta),
-                        pscale_max_theta=float(args.pscale_max_theta),
-                        pscale_min_r=float(args.pscale_min_r),
-                        pscale_max_r=float(args.pscale_max_r),
-                    )
-                    gr_csv.log(
-                        {
-                            "snr_db": ab_snr,
-                            "theta_step": th_step,
-                            "r_step": rr_step,
-                            "method": "grid_unroll_learned",
-                            "rmse_theta_deg": rmse_np(angle_error_deg_np(th_ul, theta_gt)),
-                            "rmse_r_m": rmse_np(r_ul - r_gt),
-                            "ms_per_sample": ms_ul,
-                            "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
-                        }
-                    )
-                except RuntimeError as e:
+                if int(T_resolved) <= 0:
                     gr_csv.log(
                         {
                             "snr_db": ab_snr,
@@ -772,9 +802,63 @@ def main() -> None:
                             "rmse_theta_deg": "",
                             "rmse_r_m": "",
                             "ms_per_sample": "",
-                            "notes": f"skip ({str(e)})",
+                            "notes": f"skip: T_run={int(T_resolved)} (no unroll steps)",
                         }
                     )
+                else:
+                    try:
+                        th_ul, r_ul, ms_ul, T_model_ul, T_run_ul = run_unrolled(
+                            z[:ab_n],
+                            cfg,
+                            box,
+                            device=device,
+                            theta_step=th_step,
+                            r_step=rr_step,
+                            T=T_resolved,
+                            ckpt_path=args.ckpt_path,
+                            sanitize_ckpt=bool(args.sanitize_ckpt),
+                            learnable=True,
+                            T_run=T_resolved,
+                            return_meta=True,
+                            batch_size=args.batch_size,
+                            use_pscale=bool(int(args.use_pscale)),
+                            pscale_hidden=int(args.pscale_hidden),
+                            pscale_detach_step=bool(int(args.pscale_detach_step)),
+                            pscale_logrange=float(args.pscale_logrange),
+                            pscale_amp=float(args.pscale_amp),
+                            pscale_input=str(args.pscale_input),
+                            use_t_table=bool(int(args.use_t_table)),
+                            t_table_init=float(args.t_table_init),
+                            pscale_min_theta=float(args.pscale_min_theta),
+                            pscale_max_theta=float(args.pscale_max_theta),
+                            pscale_min_r=float(args.pscale_min_r),
+                            pscale_max_r=float(args.pscale_max_r),
+                        )
+                        gr_csv.log(
+                            {
+                                "snr_db": ab_snr,
+                                "theta_step": th_step,
+                                "r_step": rr_step,
+                                "method": "grid_unroll_learned",
+                                "rmse_theta_deg": rmse_np(angle_error_deg_np(th_ul, theta_gt)),
+                                "rmse_r_m": rmse_np(r_ul - r_gt),
+                                "ms_per_sample": ms_ul,
+                                "notes": f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}",
+                            }
+                        )
+                    except RuntimeError as e:
+                        gr_csv.log(
+                            {
+                                "snr_db": ab_snr,
+                                "theta_step": th_step,
+                                "r_step": rr_step,
+                                "method": "grid_unroll_learned",
+                                "rmse_theta_deg": "",
+                                "rmse_r_m": "",
+                                "ms_per_sample": "",
+                                "notes": f"skip ({str(e)})",
+                            }
+                        )
 
     print(f"Wrote: {run_dir / 'ablate_T.csv'}")
     print(f"Wrote: {run_dir / 'grid_robustness.csv'}")
