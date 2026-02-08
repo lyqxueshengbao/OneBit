@@ -6,10 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, minimize
 
 from scripts.eval_all import run_unrolled
-from src.coarse_search import coarse_search_np
+from src.coarse_search import coarse_search_np, make_grid_1d
 from src.dataset import TargetBox
 from src.fda import FDAConfig, steering_vector_np
 from src.metrics import angle_error_deg_np, rmse_np
@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sanitize_ckpt", action="store_true")
     p.add_argument("--learned_nm_tail_iters", type=int, default=0)
     p.add_argument("--learned_nm_tail_snr_min", type=float, default=0.0)
+    p.add_argument("--run_topk_nm_baseline", type=int, default=1, choices=[0, 1])
+    p.add_argument("--topk_init_min_sep_theta_deg", type=float, default=1.0)
+    p.add_argument("--topk_init_min_sep_r_m", type=float, default=100.0)
+    p.add_argument("--joint_nm2_num_samples", type=int, default=0)
+    p.add_argument("--joint_nm2_maxiter", type=int, default=80)
     p.add_argument("--match_theta_scale_deg", type=float, default=1.0)
     p.add_argument("--match_r_scale_m", type=float, default=100.0)
     p.add_argument("--full", action="store_true")
@@ -45,6 +50,86 @@ def parse_args() -> argparse.Namespace:
 
 def ms_per_sample(dt_s: float, n: int) -> float:
     return 1000.0 * dt_s / max(int(n), 1)
+
+
+def build_grid_cache(
+    cfg: FDAConfig,
+    box: TargetBox,
+    *,
+    theta_step: float,
+    r_step: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    theta_grid = make_grid_1d(box.theta_min, box.theta_max, float(theta_step))
+    r_grid = make_grid_1d(box.r_min, box.r_max, float(r_step))
+    tt, rr = np.meshgrid(theta_grid, r_grid, indexing="ij")
+    theta_flat = tt.reshape(-1).astype(np.float32)
+    r_flat = rr.reshape(-1).astype(np.float32)
+    a_grid = steering_vector_np(theta_flat, r_flat, cfg).astype(np.complex64)  # (G,K)
+    ah_grid = np.conj(a_grid)  # (G,K)
+    norm2 = np.maximum(np.sum(np.abs(a_grid) ** 2, axis=-1).real.astype(np.float32), 1e-12)
+    return theta_flat, r_flat, ah_grid, norm2
+
+
+def topk_grid_init_no_deflation(
+    z: np.ndarray,
+    theta_flat: np.ndarray,
+    r_flat: np.ndarray,
+    ah_grid: np.ndarray,
+    norm2: np.ndarray,
+    *,
+    num_targets: int,
+    min_sep_theta_deg: float,
+    min_sep_r_m: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    n = int(z.shape[0])
+    theta0 = np.zeros((n, num_targets), dtype=np.float32)
+    r0 = np.zeros((n, num_targets), dtype=np.float32)
+
+    t0 = time.perf_counter()
+    for i in range(n):
+        inner = ah_grid @ z[i]  # (G,)
+        scores = (np.abs(inner) ** 2) / norm2
+        order = np.argsort(scores)[::-1]
+
+        picks: list[int] = []
+        pick_set: set[int] = set()
+        for idx in order:
+            th = float(theta_flat[idx])
+            rr = float(r_flat[idx])
+            ok = True
+            for j in picks:
+                dth = abs(
+                    float(
+                        angle_error_deg_np(
+                            np.array([th], dtype=np.float32),
+                            np.array([float(theta_flat[j])], dtype=np.float32),
+                        )[0]
+                    )
+                )
+                dr = abs(rr - float(r_flat[j]))
+                if dth < float(min_sep_theta_deg) and dr < float(min_sep_r_m):
+                    ok = False
+                    break
+            if ok:
+                picks.append(int(idx))
+                pick_set.add(int(idx))
+            if len(picks) >= num_targets:
+                break
+
+        if len(picks) < num_targets:
+            for idx in order:
+                idx_int = int(idx)
+                if idx_int in pick_set:
+                    continue
+                picks.append(idx_int)
+                if len(picks) >= num_targets:
+                    break
+
+        picks = picks[:num_targets]
+        theta0[i] = theta_flat[picks]
+        r0[i] = r_flat[picks]
+    init_ms = ms_per_sample(time.perf_counter() - t0, n)
+    return theta0, r0, init_ms
 
 
 def _sample_targets_with_separation(
@@ -213,6 +298,127 @@ def greedy_grid_nm(
 
     total_dt = time.perf_counter() - t0
     return theta_hat, r_hat, ms_per_sample(total_dt, n), ms_per_sample(nm_dt, n)
+
+
+def refine_nm_from_inits(
+    z: np.ndarray,
+    cfg: FDAConfig,
+    box: TargetBox,
+    theta0: np.ndarray,
+    r0: np.ndarray,
+    *,
+    nm_maxiter: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    n, num_targets = theta0.shape
+    theta_hat = np.zeros((n, num_targets), dtype=np.float32)
+    r_hat = np.zeros((n, num_targets), dtype=np.float32)
+
+    t0 = time.perf_counter()
+    for i in range(n):
+        for t in range(num_targets):
+            res = refine_nelder_mead(
+                z[i],
+                float(theta0[i, t]),
+                float(r0[i, t]),
+                cfg,
+                theta_range=(box.theta_min, box.theta_max),
+                r_range=(box.r_min, box.r_max),
+                maxiter=int(nm_maxiter),
+            )
+            theta_hat[i, t] = float(res.theta_deg)
+            r_hat[i, t] = float(res.r_m)
+    return theta_hat, r_hat, ms_per_sample(time.perf_counter() - t0, n)
+
+
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _logit_np(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    p = np.clip(p, eps, 1.0 - eps)
+    return np.log(p) - np.log(1.0 - p)
+
+
+def _decode_joint_u(u: np.ndarray, box: TargetBox) -> tuple[np.ndarray, np.ndarray]:
+    p = _sigmoid_np(u.astype(np.float64))
+    th = np.array(
+        [
+            box.theta_min + (box.theta_max - box.theta_min) * p[0],
+            box.theta_min + (box.theta_max - box.theta_min) * p[2],
+        ],
+        dtype=np.float32,
+    )
+    rr = np.array(
+        [
+            box.r_min + (box.r_max - box.r_min) * p[1],
+            box.r_min + (box.r_max - box.r_min) * p[3],
+        ],
+        dtype=np.float32,
+    )
+    return th, rr
+
+
+def _joint_projection_score_2target(
+    z_i: np.ndarray,
+    theta_pair: np.ndarray,
+    r_pair: np.ndarray,
+    cfg: FDAConfig,
+) -> float:
+    a = steering_vector_np(theta_pair.astype(np.float32), r_pair.astype(np.float32), cfg).astype(
+        np.complex64
+    )  # (2,K)
+    a_mat = a.T  # (K,2)
+    gram = a_mat.conj().T @ a_mat
+    gram = gram + (1e-5 * np.eye(2, dtype=np.complex64))
+    rhs = a_mat.conj().T @ z_i
+    coeff = np.linalg.solve(gram, rhs)
+    y_hat = a_mat @ coeff
+    return float(np.real(np.vdot(y_hat, y_hat)))
+
+
+def run_joint_nm2_from_inits(
+    z: np.ndarray,
+    cfg: FDAConfig,
+    box: TargetBox,
+    theta0: np.ndarray,
+    r0: np.ndarray,
+    *,
+    maxiter: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    n = int(theta0.shape[0])
+    theta_hat = np.zeros((n, 2), dtype=np.float32)
+    r_hat = np.zeros((n, 2), dtype=np.float32)
+
+    t0 = time.perf_counter()
+    eps = 1e-12
+    for i in range(n):
+        p_th = (theta0[i] - float(box.theta_min)) / (float(box.theta_max - box.theta_min) + eps)
+        p_r = (r0[i] - float(box.r_min)) / (float(box.r_max - box.r_min) + eps)
+        u0 = np.array(
+            [
+                _logit_np(np.array([p_th[0]], dtype=np.float64))[0],
+                _logit_np(np.array([p_r[0]], dtype=np.float64))[0],
+                _logit_np(np.array([p_th[1]], dtype=np.float64))[0],
+                _logit_np(np.array([p_r[1]], dtype=np.float64))[0],
+            ],
+            dtype=np.float64,
+        )
+
+        def f(u: np.ndarray) -> float:
+            th, rr = _decode_joint_u(np.asarray(u, dtype=np.float64), box)
+            return -_joint_projection_score_2target(z[i], th, rr, cfg)
+
+        res = minimize(
+            f,
+            u0,
+            method="Nelder-Mead",
+            options={"maxiter": int(maxiter), "xatol": 1e-3, "fatol": 1e-4},
+        )
+        th_est, rr_est = _decode_joint_u(np.asarray(res.x, dtype=np.float64), box)
+        order = np.argsort(th_est)
+        theta_hat[i] = th_est[order]
+        r_hat[i] = rr_est[order]
+    return theta_hat, r_hat, ms_per_sample(time.perf_counter() - t0, n)
 
 
 def greedy_unrolled(
@@ -424,6 +630,17 @@ def main() -> None:
 
     snr_list = [float(x) for x in args.snr_list.split(",") if x.strip()]
     rng = np.random.default_rng(int(args.seed))
+    need_topk_init = bool(int(args.run_topk_nm_baseline)) or (
+        int(args.joint_nm2_num_samples) > 0 and num_targets == 2
+    )
+    topk_cache = None
+    if need_topk_init:
+        topk_cache = build_grid_cache(
+            cfg,
+            box,
+            theta_step=float(args.theta_step),
+            r_step=float(args.r_step),
+        )
 
     for snr_idx, snr_db in enumerate(snr_list):
         theta_gt, r_gt = _sample_targets_with_separation(
@@ -493,6 +710,132 @@ def main() -> None:
                 "notes": f"num_targets={num_targets}; nm_only_ms={nm_only_ms:.3f}",
             }
         )
+
+        # 2.5) Top-K init (no deflation) + per-target NM refine.
+        topk_theta0 = None
+        topk_r0 = None
+        topk_init_ms = None
+        if topk_cache is not None:
+            th_flat, rr_flat, ah_grid, norm2 = topk_cache
+            topk_theta0, topk_r0, topk_init_ms = topk_grid_init_no_deflation(
+                z,
+                th_flat,
+                rr_flat,
+                ah_grid,
+                norm2,
+                num_targets=num_targets,
+                min_sep_theta_deg=float(args.topk_init_min_sep_theta_deg),
+                min_sep_r_m=float(args.topk_init_min_sep_r_m),
+            )
+
+        if bool(int(args.run_topk_nm_baseline)):
+            if topk_theta0 is None or topk_r0 is None or topk_init_ms is None:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": "grid_topk_nm_cpu_mt",
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": "skip (topk init unavailable)",
+                    }
+                )
+            else:
+                th_topk_nm, rr_topk_nm, nm_refine_ms = refine_nm_from_inits(
+                    z,
+                    cfg,
+                    box,
+                    topk_theta0,
+                    topk_r0,
+                    nm_maxiter=int(args.nm_maxiter),
+                )
+                rmse_th, rmse_r = matched_rmse(
+                    th_topk_nm,
+                    rr_topk_nm,
+                    theta_gt,
+                    r_gt,
+                    theta_scale_deg=float(args.match_theta_scale_deg),
+                    r_scale_m=float(args.match_r_scale_m),
+                )
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": "grid_topk_nm_cpu_mt",
+                        "rmse_theta_deg": rmse_th,
+                        "rmse_r_m": rmse_r,
+                        "ms_per_sample": float(topk_init_ms) + float(nm_refine_ms),
+                        "notes": (
+                            f"num_targets={num_targets}; no_deflation=1; "
+                            f"init_ms={float(topk_init_ms):.3f}; nm_only_ms={float(nm_refine_ms):.3f}"
+                        ),
+                    }
+                )
+
+        # 2.6) Joint-NM for K=2 (small-sample probe).
+        if num_targets != 2:
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "joint_nm2_topk_cpu_mt",
+                    "rmse_theta_deg": "",
+                    "rmse_r_m": "",
+                    "ms_per_sample": "",
+                    "notes": f"skip (num_targets={num_targets} != 2)",
+                }
+            )
+        elif int(args.joint_nm2_num_samples) <= 0:
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "joint_nm2_topk_cpu_mt",
+                    "rmse_theta_deg": "",
+                    "rmse_r_m": "",
+                    "ms_per_sample": "",
+                    "notes": "skip (joint_nm2_num_samples<=0)",
+                }
+            )
+        elif topk_theta0 is None or topk_r0 is None:
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "joint_nm2_topk_cpu_mt",
+                    "rmse_theta_deg": "",
+                    "rmse_r_m": "",
+                    "ms_per_sample": "",
+                    "notes": "skip (topk init unavailable)",
+                }
+            )
+        else:
+            n_eval = min(int(args.num_samples), int(args.joint_nm2_num_samples))
+            th_joint, rr_joint, ms_joint = run_joint_nm2_from_inits(
+                z[:n_eval],
+                cfg,
+                box,
+                topk_theta0[:n_eval, :2],
+                topk_r0[:n_eval, :2],
+                maxiter=int(args.joint_nm2_maxiter),
+            )
+            rmse_th, rmse_r = matched_rmse(
+                th_joint,
+                rr_joint,
+                theta_gt[:n_eval],
+                r_gt[:n_eval],
+                theta_scale_deg=float(args.match_theta_scale_deg),
+                r_scale_m=float(args.match_r_scale_m),
+            )
+            csv.log(
+                {
+                    "snr_db": snr_db,
+                    "method": "joint_nm2_topk_cpu_mt",
+                    "rmse_theta_deg": rmse_th,
+                    "rmse_r_m": rmse_r,
+                    "ms_per_sample": ms_joint,
+                    "notes": (
+                        f"num_targets=2; n_eval={n_eval}; no_deflation=1; "
+                        f"maxiter={int(args.joint_nm2_maxiter)}"
+                    ),
+                }
+            )
 
         # 3) Greedy fixed unroll.
         if t_run <= 0:
