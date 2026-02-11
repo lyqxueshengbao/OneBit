@@ -109,6 +109,10 @@ def refine_nelder_mead_with_history(
     hist_len: int = 10,
     xatol: float = 1e-3,
     fatol: float = 1e-4,
+    early_stop_eps_theta: float | None = None,
+    early_stop_eps_r: float | None = None,
+    early_stop_patience: int = 0,
+    early_stop_kmin: int = 1,
     eps: float = 1e-12,
 ) -> tuple[NMResult, np.ndarray, np.ndarray]:
     """
@@ -137,28 +141,74 @@ def refine_nelder_mead_with_history(
     )
     u0 = _logit(p0)
 
+    f_calls = 0
+
     def f(u: np.ndarray) -> float:
+        nonlocal f_calls
+        f_calls += 1
         theta, r = u_to_tr(u)
         val = float(J_np(np.array(theta, dtype=np.float32), np.array(r, dtype=np.float32), z, cfg))
         return -val
 
     hist_u: List[np.ndarray] = []
+    early_on = (
+        early_stop_eps_theta is not None
+        and early_stop_eps_r is not None
+        and int(early_stop_patience) > 0
+        and int(early_stop_kmin) > 0
+    )
+    stable = 0
+
+    class _EarlyStop(Exception):
+        pass
+
+    def _wrap_abs_deg(delta: float) -> float:
+        return abs((delta + 180.0) % 360.0 - 180.0)
 
     def cb(xk: np.ndarray) -> None:
         if len(hist_u) >= int(hist_len):
             return
         hist_u.append(np.asarray(xk, dtype=np.float64).copy())
+        if not early_on or len(hist_u) < 2:
+            return
+        th_prev, r_prev = u_to_tr(hist_u[-2])
+        th_cur, r_cur = u_to_tr(hist_u[-1])
+        dth = _wrap_abs_deg(float(th_cur - th_prev))
+        dr = abs(float(r_cur - r_prev))
+        if dth < float(early_stop_eps_theta) and dr < float(early_stop_eps_r):
+            stable_local = 1
+        else:
+            stable_local = 0
+        nonlocal stable
+        stable = (stable + 1) if stable_local else 0
+        if len(hist_u) >= int(early_stop_kmin) and stable >= int(early_stop_patience):
+            raise _EarlyStop()
 
-    res = minimize(
-        f,
-        u0,
-        method="Nelder-Mead",
-        callback=cb,
-        options={"maxiter": int(maxiter), "xatol": float(xatol), "fatol": float(fatol)},
-    )
+    early_stopped = False
+    try:
+        res = minimize(
+            f,
+            u0,
+            method="Nelder-Mead",
+            callback=cb,
+            options={"maxiter": int(maxiter), "xatol": float(xatol), "fatol": float(fatol)},
+        )
+        x_final = np.asarray(res.x, dtype=np.float64)
+        fun_final = float(res.fun)
+        nfev = int(res.nfev)
+        nit = int(res.nit)
+        success = bool(res.success)
+        message = str(res.message)
+    except _EarlyStop:
+        early_stopped = True
+        x_final = hist_u[-1].copy() if len(hist_u) > 0 else u0.copy()
+        fun_final = float(f(x_final))
+        nfev = int(f_calls)
+        nit = int(len(hist_u))
+        success = True
+        message = "early-stop (callback)"
 
     # Ensure final point is included as the last history element when available.
-    x_final = np.asarray(res.x, dtype=np.float64)
     if int(hist_len) > 0:
         if len(hist_u) == 0:
             hist_u.append(x_final.copy())
@@ -170,11 +220,11 @@ def refine_nelder_mead_with_history(
     out = NMResult(
         theta_deg=float(theta_hat),
         r_m=float(r_hat),
-        fun=float(res.fun),
-        nfev=int(res.nfev),
-        nit=int(res.nit),
-        success=bool(res.success),
-        message=str(res.message),
+        fun=float(fun_final),
+        nfev=int(nfev),
+        nit=int(nit),
+        success=bool(success),
+        message=(f"{message}; hist={len(hist_u)}" if early_stopped else str(message)),
     )
 
     # Map history to (theta,r), pad/truncate to hist_len.

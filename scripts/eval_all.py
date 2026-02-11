@@ -11,7 +11,7 @@ from src.coarse_search import CoarseSearcherTorch, coarse_search_np
 from src.dataset import TargetBox, synthesize_np
 from src.fda import FDAConfig
 from src.metrics import angle_error_deg_np, rmse_np
-from src.nm_refine import refine_nelder_mead
+from src.nm_refine import refine_nelder_mead, refine_nelder_mead_with_history
 from src.unroll_refine import Box, Refiner
 from src.utils import CsvLogger, Timer, ensure_dir, seed_all, timestamp, write_json
 
@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     # Optional 2-stage hybrid: learned unroll + tiny NM tail (for Pareto probing).
     p.add_argument("--learned_nm_tail_iters", type=int, default=0)
     p.add_argument("--learned_nm_tail_snr_min", type=float, default=0.0)
+    p.add_argument("--learned_nm_tail_adapt", type=int, default=0, choices=[0, 1])
+    p.add_argument("--learned_nm_tail_kmin", type=int, default=2)
+    p.add_argument("--learned_nm_tail_kmax", type=int, default=8)
+    p.add_argument("--learned_nm_tail_eps_theta", type=float, default=0.02)
+    p.add_argument("--learned_nm_tail_eps_r", type=float, default=0.5)
+    p.add_argument("--learned_nm_tail_patience", type=int, default=2)
     p.add_argument("--ckpt_path", type=str, default="")
     p.add_argument("--sanitize_ckpt", action="store_true")
     p.add_argument("--full", action="store_true")
@@ -69,6 +75,14 @@ def parse_args() -> argparse.Namespace:
 
 def ms_per_sample(dt_s: float, n: int) -> float:
     return 1000.0 * dt_s / max(int(n), 1)
+
+
+def _pick_adaptive_k(nm_res_nit: int, kmin: int, kmax: int) -> int:
+    k_lo = max(int(kmin), 1)
+    k_hi = max(int(kmax), k_lo)
+    if int(nm_res_nit) <= 0:
+        return k_lo
+    return int(min(max(int(nm_res_nit), k_lo), k_hi))
 
 
 def _nonfinite_module_tensors(module: torch.nn.Module) -> list[str]:
@@ -672,6 +686,90 @@ def main() -> None:
                         "notes": (
                             f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}; "
                             f"nm_tail_iters={tail_iters}; nm_tail_only_ms={nm_tail_ms:.3f}"
+                        ),
+                    }
+                )
+
+        # 6) optional learned + adaptive NM tail (CPU).
+        tail_adapt = bool(int(args.learned_nm_tail_adapt))
+        if tail_adapt:
+            method_tail_adapt = "grid_unroll_learned_nm_adapt"
+            kmin_cfg = max(int(args.learned_nm_tail_kmin), 1)
+            kmax_cfg = max(int(args.learned_nm_tail_kmax), kmin_cfg)
+            if not args.ckpt_path:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail_adapt,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": "skip (no --ckpt_path)",
+                    }
+                )
+            elif snr_db < float(args.learned_nm_tail_snr_min):
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail_adapt,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip (snr_db={snr_db} < learned_nm_tail_snr_min={float(args.learned_nm_tail_snr_min)})",
+                    }
+                )
+            elif not learned_ok:
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail_adapt,
+                        "rmse_theta_deg": "",
+                        "rmse_r_m": "",
+                        "ms_per_sample": "",
+                        "notes": f"skip (learned failed: {learned_skip_note})",
+                    }
+                )
+            else:
+                th_tail = np.zeros_like(theta_gt)
+                r_tail = np.zeros_like(r_gt)
+                k_used = np.zeros((args.num_samples,), dtype=np.int32)
+                with Timer() as t_tail:
+                    for i in range(args.num_samples):
+                        res_i, th_hist, r_hist = refine_nelder_mead_with_history(
+                            z[i],
+                            float(th_ul[i]),
+                            float(r_ul[i]),
+                            cfg,
+                            theta_range=(box.theta_min, box.theta_max),
+                            r_range=(box.r_min, box.r_max),
+                            maxiter=kmax_cfg,
+                            hist_len=kmax_cfg,
+                            early_stop_eps_theta=float(args.learned_nm_tail_eps_theta),
+                            early_stop_eps_r=float(args.learned_nm_tail_eps_r),
+                            early_stop_patience=int(args.learned_nm_tail_patience),
+                            early_stop_kmin=kmin_cfg,
+                        )
+                        k_i = _pick_adaptive_k(int(res_i.nit), kmin_cfg, kmax_cfg)
+                        idx = min(max(k_i - 1, 0), len(th_hist) - 1)
+                        th_tail[i] = float(th_hist[idx])
+                        r_tail[i] = float(r_hist[idx])
+                        k_used[i] = int(k_i)
+                nm_tail_ms = ms_per_sample(t_tail.dt, args.num_samples)
+                csv.log(
+                    {
+                        "snr_db": snr_db,
+                        "method": method_tail_adapt,
+                        "rmse_theta_deg": rmse_np(angle_error_deg_np(th_tail, theta_gt)),
+                        "rmse_r_m": rmse_np(r_tail - r_gt),
+                        "ms_per_sample": float(ms_ul) + float(nm_tail_ms),
+                        "notes": (
+                            f"ckpt={args.ckpt_path}; T_model={T_model_ul}, T_run={T_run_ul}; "
+                            f"nm_tail_adapt=1; k_min={kmin_cfg}; k_max={kmax_cfg}; "
+                            f"eps_theta={float(args.learned_nm_tail_eps_theta):.4g}; "
+                            f"eps_r={float(args.learned_nm_tail_eps_r):.4g}; "
+                            f"patience={int(args.learned_nm_tail_patience)}; "
+                            f"avg_k={float(np.mean(k_used)):.3f}; p50_k={int(np.median(k_used))}; "
+                            f"p90_k={int(np.quantile(k_used, 0.9))}; nm_tail_only_ms={nm_tail_ms:.3f}"
                         ),
                     }
                 )
