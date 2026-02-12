@@ -141,6 +141,9 @@ class Refiner(nn.Module):
         step_attn_max_theta: float = 1.2,
         step_attn_min_r: float = 0.8,
         step_attn_max_r: float = 1.2,
+        use_phys_precond2: bool = False,
+        phys_precond_diag_logmax: float = 0.35,
+        phys_precond_offdiag_max: float = 0.35,
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -189,6 +192,9 @@ class Refiner(nn.Module):
         self.step_attn_max_theta = float(step_attn_max_theta)
         self.step_attn_min_r = float(step_attn_min_r)
         self.step_attn_max_r = float(step_attn_max_r)
+        self.use_phys_precond2 = bool(use_phys_precond2)
+        self.phys_precond_diag_logmax = float(phys_precond_diag_logmax)
+        self.phys_precond_offdiag_max = float(phys_precond_offdiag_max)
 
         if self.use_pscale:
             # Parse pscale_input tokens (order preserved, deduped).
@@ -239,6 +245,11 @@ class Refiner(nn.Module):
             # Identity init: delta=0 => gate=1.
             nn.init.zeros_(self.step_attn_mlp[-1].weight)
             nn.init.zeros_(self.step_attn_mlp[-1].bias)
+        if self.use_phys_precond2:
+            # Per-step 2x2 SPD preconditioner:
+            # P_t = L_t L_t^T, L_t = [[exp(a_t), 0], [b_t, exp(c_t)]]
+            # This preserves physics-driven gradient update while learning theta/r coupling.
+            self.phys_precond_raw = nn.Parameter(torch.zeros((self.T, 3), dtype=torch.float32))
 
         self.init_alpha = float(init_alpha)
         self.init_lambda = float(init_lambda)
@@ -335,11 +346,14 @@ class Refiner(nn.Module):
         raw_ar = self.alpha_r_raw
         raw_lt = self.lambda_theta_raw
         raw_lr = self.lambda_r_raw
+        raw_pc = getattr(self, "phys_precond_raw", None)
         if sanitize_in_forward:
             raw_at = torch.nan_to_num(raw_at, nan=0.0, posinf=0.0, neginf=0.0)
             raw_ar = torch.nan_to_num(raw_ar, nan=0.0, posinf=0.0, neginf=0.0)
             raw_lt = torch.nan_to_num(raw_lt, nan=0.0, posinf=0.0, neginf=0.0)
             raw_lr = torch.nan_to_num(raw_lr, nan=0.0, posinf=0.0, neginf=0.0)
+            if raw_pc is not None:
+                raw_pc = torch.nan_to_num(raw_pc, nan=0.0, posinf=0.0, neginf=0.0)
 
         alpha_theta = self._alpha_from_raw(raw_at).to(u.device)
         alpha_r = self._alpha_from_raw(raw_ar).to(u.device)
@@ -363,6 +377,8 @@ class Refiner(nn.Module):
         step_attn_count = 0
         step_attn_clamp_hits = None
         step_attn_clamp_total = 0.0
+        phys_precond_sum = None
+        phys_precond_count = 0
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
@@ -445,6 +461,30 @@ class Refiner(nn.Module):
                     # Avoid in-place update (needed when mul is learnable).
                     step_u_r = step_u[:, 1] * scale_final
                     step_u = torch.stack([step_u[:, 0], step_u_r], dim=-1)
+
+                if self.use_phys_precond2 and raw_pc is not None:
+                    p_raw = raw_pc[t]
+                    p_raw = torch.where(torch.isfinite(p_raw), p_raw, torch.zeros_like(p_raw))
+                    log_max = float(self.phys_precond_diag_logmax)
+                    a_t = torch.clamp(p_raw[0], -log_max, log_max)
+                    c_t = torch.clamp(p_raw[1], -log_max, log_max)
+                    b_t = torch.tanh(p_raw[2]) * float(self.phys_precond_offdiag_max)
+                    l00 = torch.exp(a_t)
+                    l11 = torch.exp(c_t)
+                    # P = L L^T
+                    p00 = l00 * l00
+                    p01 = l00 * b_t
+                    p11 = b_t * b_t + l11 * l11
+                    step_u_theta = p00 * step_u[:, 0] + p01 * step_u[:, 1]
+                    step_u_r = p01 * step_u[:, 0] + p11 * step_u[:, 1]
+                    step_u = torch.stack([step_u_theta, step_u_r], dim=-1)
+                    with torch.no_grad():
+                        if phys_precond_sum is None:
+                            phys_precond_sum = torch.zeros((3,), device=step_u.device, dtype=torch.float32)
+                        phys_precond_sum += torch.stack(
+                            [p00.detach().to(torch.float32), p01.detach().to(torch.float32), p11.detach().to(torch.float32)]
+                        )
+                        phys_precond_count += 1
 
                 if self.use_step_attn:
                     # Attention-like per-sample gate on update vector (stability-biased range).
@@ -707,6 +747,11 @@ class Refiner(nn.Module):
             debug["step_attn_gate_mean"] = mean
             debug["step_attn_gate_std"] = std
             debug["step_attn_clamp_hit_ratio"] = step_attn_clamp_hits / max(float(step_attn_clamp_total), 1.0)
+        if self.use_phys_precond2 and phys_precond_sum is not None:
+            mean = phys_precond_sum / max(float(phys_precond_count), 1.0)
+            debug["phys_precond_p00_mean"] = mean[0]
+            debug["phys_precond_p01_mean"] = mean[1]
+            debug["phys_precond_p11_mean"] = mean[2]
 
         if not return_trace:
             return theta_T, r_T, debug

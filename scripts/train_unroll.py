@@ -164,6 +164,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--step_attn_max_theta", type=float, default=1.2)
     p.add_argument("--step_attn_min_r", type=float, default=0.8)
     p.add_argument("--step_attn_max_r", type=float, default=1.2)
+    # Physics-consistent 2x2 SPD preconditioner on update vector.
+    p.add_argument("--use_phys_precond2", type=int, default=0, choices=[0, 1])
+    p.add_argument("--phys_precond_diag_logmax", type=float, default=0.35)
+    p.add_argument("--phys_precond_offdiag_max", type=float, default=0.35)
     # Monotone accept-reject / backtracking for each unroll step.
     p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
     p.add_argument("--ar_backtrack_max", type=int, default=0)
@@ -493,6 +497,9 @@ def main() -> None:
         step_attn_max_theta=float(args.step_attn_max_theta),
         step_attn_min_r=float(args.step_attn_min_r),
         step_attn_max_r=float(args.step_attn_max_r),
+        use_phys_precond2=bool(int(args.use_phys_precond2)),
+        phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+        phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
         accept_reject=bool(int(args.accept_reject)),
         ar_backtrack_max=int(args.ar_backtrack_max),
         ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -990,6 +997,14 @@ def main() -> None:
                         "step_attn_clamp_hit_ratio_r": float(
                             dbg["step_attn_clamp_hit_ratio"][1].detach().cpu().item()
                         ),
+                    }
+                )
+            if "phys_precond_p00_mean" in dbg:
+                row.update(
+                    {
+                        "phys_precond_p00_mean": float(dbg["phys_precond_p00_mean"].detach().cpu().item()),
+                        "phys_precond_p01_mean": float(dbg["phys_precond_p01_mean"].detach().cpu().item()),
+                        "phys_precond_p11_mean": float(dbg["phys_precond_p11_mean"].detach().cpu().item()),
                     }
                 )
             logger.log(row)

@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--step_attn_max_theta", type=float, default=1.2)
     p.add_argument("--step_attn_min_r", type=float, default=0.8)
     p.add_argument("--step_attn_max_r", type=float, default=1.2)
+    # Physics-consistent 2x2 SPD preconditioner on update vector.
+    p.add_argument("--use_phys_precond2", type=int, default=0, choices=[0, 1])
+    p.add_argument("--phys_precond_diag_logmax", type=float, default=0.35)
+    p.add_argument("--phys_precond_offdiag_max", type=float, default=0.35)
     # Monotone accept-reject / backtracking for each unroll step.
     p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
     p.add_argument("--ar_backtrack_max", type=int, default=0)
@@ -154,6 +158,7 @@ def slice_state_dict_for_T(sd: dict, T_run: int, T_model: int) -> dict:
         "lambda_theta_raw",
         "lambda_r_raw",
         "t_log_scale_table",
+        "phys_precond_raw",
     }
     for name, value in sd.items():
         if not torch.is_tensor(value):
@@ -162,7 +167,7 @@ def slice_state_dict_for_T(sd: dict, T_run: int, T_model: int) -> dict:
         should_slice = name in stepwise_names or (
             value.ndim >= 1
             and int(value.shape[0]) == t_model
-            and any(token in name for token in ("alpha", "lambda", "t_log_scale", "step"))
+            and any(token in name for token in ("alpha", "lambda", "t_log_scale", "step", "precond"))
         )
         if should_slice:
             if value.ndim < 1 or int(value.shape[0]) < t_run:
@@ -210,6 +215,9 @@ def run_unrolled(
     step_attn_max_theta: float = 1.2,
     step_attn_min_r: float = 0.8,
     step_attn_max_r: float = 1.2,
+    use_phys_precond2: bool = False,
+    phys_precond_diag_logmax: float = 0.35,
+    phys_precond_offdiag_max: float = 0.35,
     accept_reject: bool = False,
     ar_backtrack_max: int = 0,
     ar_backtrack_factor: float = 0.5,
@@ -253,6 +261,9 @@ def run_unrolled(
     step_attn_max_theta_cfg = float(step_attn_max_theta)
     step_attn_min_r_cfg = float(step_attn_min_r)
     step_attn_max_r_cfg = float(step_attn_max_r)
+    use_phys_precond2_cfg = bool(use_phys_precond2)
+    phys_precond_diag_logmax_cfg = float(phys_precond_diag_logmax)
+    phys_precond_offdiag_max_cfg = float(phys_precond_offdiag_max)
     accept_reject_cfg = bool(accept_reject)
     ar_backtrack_max_cfg = int(ar_backtrack_max)
     ar_backtrack_factor_cfg = float(ar_backtrack_factor)
@@ -294,6 +305,13 @@ def run_unrolled(
         step_attn_max_theta_cfg = float(ckpt_args.get("step_attn_max_theta", step_attn_max_theta_cfg))
         step_attn_min_r_cfg = float(ckpt_args.get("step_attn_min_r", step_attn_min_r_cfg))
         step_attn_max_r_cfg = float(ckpt_args.get("step_attn_max_r", step_attn_max_r_cfg))
+        use_phys_precond2_cfg = bool(int(ckpt_args.get("use_phys_precond2", 0))) or ("phys_precond_raw" in sd)
+        phys_precond_diag_logmax_cfg = float(
+            ckpt_args.get("phys_precond_diag_logmax", phys_precond_diag_logmax_cfg)
+        )
+        phys_precond_offdiag_max_cfg = float(
+            ckpt_args.get("phys_precond_offdiag_max", phys_precond_offdiag_max_cfg)
+        )
         accept_reject_cfg = bool(int(ckpt_args.get("accept_reject", int(accept_reject_cfg))))
         ar_backtrack_max_cfg = int(ckpt_args.get("ar_backtrack_max", ar_backtrack_max_cfg))
         ar_backtrack_factor_cfg = float(ckpt_args.get("ar_backtrack_factor", ar_backtrack_factor_cfg))
@@ -342,6 +360,9 @@ def run_unrolled(
         step_attn_max_theta=step_attn_max_theta_cfg,
         step_attn_min_r=step_attn_min_r_cfg,
         step_attn_max_r=step_attn_max_r_cfg,
+        use_phys_precond2=use_phys_precond2_cfg,
+        phys_precond_diag_logmax=phys_precond_diag_logmax_cfg,
+        phys_precond_offdiag_max=phys_precond_offdiag_max_cfg,
         accept_reject=accept_reject_cfg,
         ar_backtrack_max=ar_backtrack_max_cfg,
         ar_backtrack_factor=ar_backtrack_factor_cfg,
@@ -561,6 +582,9 @@ def main() -> None:
                 step_attn_max_theta=float(args.step_attn_max_theta),
                 step_attn_min_r=float(args.step_attn_min_r),
                 step_attn_max_r=float(args.step_attn_max_r),
+                use_phys_precond2=bool(int(args.use_phys_precond2)),
+                phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+                phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
                 accept_reject=bool(int(args.accept_reject)),
                 ar_backtrack_max=int(args.ar_backtrack_max),
                 ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -637,6 +661,9 @@ def main() -> None:
                         step_attn_max_theta=float(args.step_attn_max_theta),
                         step_attn_min_r=float(args.step_attn_min_r),
                         step_attn_max_r=float(args.step_attn_max_r),
+                        use_phys_precond2=bool(int(args.use_phys_precond2)),
+                        phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+                        phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
                         accept_reject=bool(int(args.accept_reject)),
                         ar_backtrack_max=int(args.ar_backtrack_max),
                         ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -896,6 +923,9 @@ def main() -> None:
             step_attn_max_theta=float(args.step_attn_max_theta),
             step_attn_min_r=float(args.step_attn_min_r),
             step_attn_max_r=float(args.step_attn_max_r),
+            use_phys_precond2=bool(int(args.use_phys_precond2)),
+            phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+            phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
             accept_reject=bool(int(args.accept_reject)),
             ar_backtrack_max=int(args.ar_backtrack_max),
             ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -1073,6 +1103,9 @@ def main() -> None:
                     step_attn_max_theta=float(args.step_attn_max_theta),
                     step_attn_min_r=float(args.step_attn_min_r),
                     step_attn_max_r=float(args.step_attn_max_r),
+                    use_phys_precond2=bool(int(args.use_phys_precond2)),
+                    phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+                    phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
                     accept_reject=bool(int(args.accept_reject)),
                     ar_backtrack_max=int(args.ar_backtrack_max),
                     ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -1142,6 +1175,9 @@ def main() -> None:
                             step_attn_max_theta=float(args.step_attn_max_theta),
                             step_attn_min_r=float(args.step_attn_min_r),
                             step_attn_max_r=float(args.step_attn_max_r),
+                            use_phys_precond2=bool(int(args.use_phys_precond2)),
+                            phys_precond_diag_logmax=float(args.phys_precond_diag_logmax),
+                            phys_precond_offdiag_max=float(args.phys_precond_offdiag_max),
                             accept_reject=bool(int(args.accept_reject)),
                             ar_backtrack_max=int(args.ar_backtrack_max),
                             ar_backtrack_factor=float(args.ar_backtrack_factor),
