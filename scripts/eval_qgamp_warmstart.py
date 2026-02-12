@@ -48,6 +48,12 @@ def ms_per_sample(dt_s: float, n: int) -> float:
     return 1000.0 * dt_s / max(int(n), 1)
 
 
+def _safe_seed(base_seed: int, snr_db: float) -> int:
+    # Map (base_seed, snr_db) to a stable non-negative integer seed.
+    snr_key = int(round(float(snr_db) * 10.0))
+    return int((int(base_seed) * 1000003 + snr_key * 9176 + 12345) % (2**32 - 1))
+
+
 def _infer_t_model(sd: dict, ckpt_args: dict, t_fallback: int) -> int:
     t_arg = ckpt_args.get("T", None)
     if t_arg is not None:
@@ -249,7 +255,7 @@ def main() -> None:
             )
             r_gt = np.random.uniform(box.r_min, box.r_max, size=(int(args.num_samples),)).astype(np.float32)
             snr_arr = np.full_like(theta_gt, float(snr), dtype=np.float32)
-            _, z, _ = synthesize_np(theta_gt, r_gt, snr_arr, cfg, seed=int(args.seed + int(round(snr * 10))))
+            _, z, _ = synthesize_np(theta_gt, r_gt, snr_arr, cfg, seed=_safe_seed(int(args.seed), float(snr)))
         _ = tm_syn
 
         # 1) Grid only.
@@ -460,4 +466,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
