@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_max_theta", type=float, default=1.3)
     p.add_argument("--pscale_min_r", type=float, default=0.7)
     p.add_argument("--pscale_max_r", type=float, default=1.3)
+    # Lightweight attention-like gate on each unroll update.
+    p.add_argument("--use_step_attn", type=int, default=0, choices=[0, 1])
+    p.add_argument("--step_attn_hidden", type=int, default=32)
+    p.add_argument("--step_attn_detach_feat", type=int, default=1, choices=[0, 1])
+    p.add_argument("--step_attn_amp", type=float, default=0.3)
+    p.add_argument("--step_attn_min_theta", type=float, default=0.8)
+    p.add_argument("--step_attn_max_theta", type=float, default=1.2)
+    p.add_argument("--step_attn_min_r", type=float, default=0.8)
+    p.add_argument("--step_attn_max_r", type=float, default=1.2)
     # Monotone accept-reject / backtracking for each unroll step.
     p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
     p.add_argument("--ar_backtrack_max", type=int, default=0)
@@ -193,6 +202,14 @@ def run_unrolled(
     pscale_max_theta: float = 1.3,
     pscale_min_r: float = 0.7,
     pscale_max_r: float = 1.3,
+    use_step_attn: bool = False,
+    step_attn_hidden: int = 32,
+    step_attn_detach_feat: bool = True,
+    step_attn_amp: float = 0.3,
+    step_attn_min_theta: float = 0.8,
+    step_attn_max_theta: float = 1.2,
+    step_attn_min_r: float = 0.8,
+    step_attn_max_r: float = 1.2,
     accept_reject: bool = False,
     ar_backtrack_max: int = 0,
     ar_backtrack_factor: float = 0.5,
@@ -228,6 +245,14 @@ def run_unrolled(
     pscale_max_theta_cfg = float(pscale_max_theta)
     pscale_min_r_cfg = float(pscale_min_r)
     pscale_max_r_cfg = float(pscale_max_r)
+    use_step_attn_cfg = bool(use_step_attn)
+    step_attn_hidden_cfg = int(step_attn_hidden)
+    step_attn_detach_feat_cfg = bool(step_attn_detach_feat)
+    step_attn_amp_cfg = float(step_attn_amp)
+    step_attn_min_theta_cfg = float(step_attn_min_theta)
+    step_attn_max_theta_cfg = float(step_attn_max_theta)
+    step_attn_min_r_cfg = float(step_attn_min_r)
+    step_attn_max_r_cfg = float(step_attn_max_r)
     accept_reject_cfg = bool(accept_reject)
     ar_backtrack_max_cfg = int(ar_backtrack_max)
     ar_backtrack_factor_cfg = float(ar_backtrack_factor)
@@ -259,6 +284,16 @@ def run_unrolled(
         pscale_max_theta_cfg = float(ckpt_args.get("pscale_max_theta", pscale_max_theta_cfg))
         pscale_min_r_cfg = float(ckpt_args.get("pscale_min_r", pscale_min_r_cfg))
         pscale_max_r_cfg = float(ckpt_args.get("pscale_max_r", pscale_max_r_cfg))
+        use_step_attn_cfg = bool(int(ckpt_args.get("use_step_attn", 0))) or any(
+            str(k).startswith("step_attn_mlp.") for k in sd.keys()
+        )
+        step_attn_hidden_cfg = int(ckpt_args.get("step_attn_hidden", step_attn_hidden_cfg))
+        step_attn_detach_feat_cfg = bool(int(ckpt_args.get("step_attn_detach_feat", int(step_attn_detach_feat_cfg))))
+        step_attn_amp_cfg = float(ckpt_args.get("step_attn_amp", step_attn_amp_cfg))
+        step_attn_min_theta_cfg = float(ckpt_args.get("step_attn_min_theta", step_attn_min_theta_cfg))
+        step_attn_max_theta_cfg = float(ckpt_args.get("step_attn_max_theta", step_attn_max_theta_cfg))
+        step_attn_min_r_cfg = float(ckpt_args.get("step_attn_min_r", step_attn_min_r_cfg))
+        step_attn_max_r_cfg = float(ckpt_args.get("step_attn_max_r", step_attn_max_r_cfg))
         accept_reject_cfg = bool(int(ckpt_args.get("accept_reject", int(accept_reject_cfg))))
         ar_backtrack_max_cfg = int(ckpt_args.get("ar_backtrack_max", ar_backtrack_max_cfg))
         ar_backtrack_factor_cfg = float(ckpt_args.get("ar_backtrack_factor", ar_backtrack_factor_cfg))
@@ -299,6 +334,14 @@ def run_unrolled(
         pscale_max_theta=pscale_max_theta_cfg,
         pscale_min_r=pscale_min_r_cfg,
         pscale_max_r=pscale_max_r_cfg,
+        use_step_attn=use_step_attn_cfg,
+        step_attn_hidden=step_attn_hidden_cfg,
+        step_attn_detach_feat=step_attn_detach_feat_cfg,
+        step_attn_amp=step_attn_amp_cfg,
+        step_attn_min_theta=step_attn_min_theta_cfg,
+        step_attn_max_theta=step_attn_max_theta_cfg,
+        step_attn_min_r=step_attn_min_r_cfg,
+        step_attn_max_r=step_attn_max_r_cfg,
         accept_reject=accept_reject_cfg,
         ar_backtrack_max=ar_backtrack_max_cfg,
         ar_backtrack_factor=ar_backtrack_factor_cfg,
@@ -510,6 +553,14 @@ def main() -> None:
                 pscale_max_theta=float(args.pscale_max_theta),
                 pscale_min_r=float(args.pscale_min_r),
                 pscale_max_r=float(args.pscale_max_r),
+                use_step_attn=bool(int(args.use_step_attn)),
+                step_attn_hidden=int(args.step_attn_hidden),
+                step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+                step_attn_amp=float(args.step_attn_amp),
+                step_attn_min_theta=float(args.step_attn_min_theta),
+                step_attn_max_theta=float(args.step_attn_max_theta),
+                step_attn_min_r=float(args.step_attn_min_r),
+                step_attn_max_r=float(args.step_attn_max_r),
                 accept_reject=bool(int(args.accept_reject)),
                 ar_backtrack_max=int(args.ar_backtrack_max),
                 ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -578,6 +629,14 @@ def main() -> None:
                         pscale_max_theta=float(args.pscale_max_theta),
                         pscale_min_r=float(args.pscale_min_r),
                         pscale_max_r=float(args.pscale_max_r),
+                        use_step_attn=bool(int(args.use_step_attn)),
+                        step_attn_hidden=int(args.step_attn_hidden),
+                        step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+                        step_attn_amp=float(args.step_attn_amp),
+                        step_attn_min_theta=float(args.step_attn_min_theta),
+                        step_attn_max_theta=float(args.step_attn_max_theta),
+                        step_attn_min_r=float(args.step_attn_min_r),
+                        step_attn_max_r=float(args.step_attn_max_r),
                         accept_reject=bool(int(args.accept_reject)),
                         ar_backtrack_max=int(args.ar_backtrack_max),
                         ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -829,6 +888,14 @@ def main() -> None:
             pscale_max_theta=float(args.pscale_max_theta),
             pscale_min_r=float(args.pscale_min_r),
             pscale_max_r=float(args.pscale_max_r),
+            use_step_attn=bool(int(args.use_step_attn)),
+            step_attn_hidden=int(args.step_attn_hidden),
+            step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+            step_attn_amp=float(args.step_attn_amp),
+            step_attn_min_theta=float(args.step_attn_min_theta),
+            step_attn_max_theta=float(args.step_attn_max_theta),
+            step_attn_min_r=float(args.step_attn_min_r),
+            step_attn_max_r=float(args.step_attn_max_r),
             accept_reject=bool(int(args.accept_reject)),
             ar_backtrack_max=int(args.ar_backtrack_max),
             ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -998,6 +1065,14 @@ def main() -> None:
                     pscale_max_theta=float(args.pscale_max_theta),
                     pscale_min_r=float(args.pscale_min_r),
                     pscale_max_r=float(args.pscale_max_r),
+                    use_step_attn=bool(int(args.use_step_attn)),
+                    step_attn_hidden=int(args.step_attn_hidden),
+                    step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+                    step_attn_amp=float(args.step_attn_amp),
+                    step_attn_min_theta=float(args.step_attn_min_theta),
+                    step_attn_max_theta=float(args.step_attn_max_theta),
+                    step_attn_min_r=float(args.step_attn_min_r),
+                    step_attn_max_r=float(args.step_attn_max_r),
                     accept_reject=bool(int(args.accept_reject)),
                     ar_backtrack_max=int(args.ar_backtrack_max),
                     ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -1059,6 +1134,14 @@ def main() -> None:
                             pscale_max_theta=float(args.pscale_max_theta),
                             pscale_min_r=float(args.pscale_min_r),
                             pscale_max_r=float(args.pscale_max_r),
+                            use_step_attn=bool(int(args.use_step_attn)),
+                            step_attn_hidden=int(args.step_attn_hidden),
+                            step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+                            step_attn_amp=float(args.step_attn_amp),
+                            step_attn_min_theta=float(args.step_attn_min_theta),
+                            step_attn_max_theta=float(args.step_attn_max_theta),
+                            step_attn_min_r=float(args.step_attn_min_r),
+                            step_attn_max_r=float(args.step_attn_max_r),
                             accept_reject=bool(int(args.accept_reject)),
                             ar_backtrack_max=int(args.ar_backtrack_max),
                             ar_backtrack_factor=float(args.ar_backtrack_factor),

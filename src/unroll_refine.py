@@ -133,6 +133,14 @@ class Refiner(nn.Module):
         pscale_max_theta: float = 1.3,
         pscale_min_r: float = 0.7,
         pscale_max_r: float = 1.3,
+        use_step_attn: bool = False,
+        step_attn_hidden: int = 32,
+        step_attn_detach_feat: bool = True,
+        step_attn_amp: float = 0.3,
+        step_attn_min_theta: float = 0.8,
+        step_attn_max_theta: float = 1.2,
+        step_attn_min_r: float = 0.8,
+        step_attn_max_r: float = 1.2,
         objective: str = "logistic",  # {"logistic","probit","J"}
         init_alpha: float = 1e-2,
         init_lambda: float = 1e-3,
@@ -174,6 +182,13 @@ class Refiner(nn.Module):
         self.pscale_max_theta = float(pscale_max_theta)
         self.pscale_min_r = float(pscale_min_r)
         self.pscale_max_r = float(pscale_max_r)
+        self.use_step_attn = bool(use_step_attn)
+        self.step_attn_detach_feat = bool(step_attn_detach_feat)
+        self.step_attn_amp = float(step_attn_amp)
+        self.step_attn_min_theta = float(step_attn_min_theta)
+        self.step_attn_max_theta = float(step_attn_max_theta)
+        self.step_attn_min_r = float(step_attn_min_r)
+        self.step_attn_max_r = float(step_attn_max_r)
 
         if self.use_pscale:
             # Parse pscale_input tokens (order preserved, deduped).
@@ -211,6 +226,19 @@ class Refiner(nn.Module):
             self.t_log_scale_table = nn.Parameter(
                 torch.full((self.T, 2), float(t_table_init), dtype=torch.float32)
             )
+        if self.use_step_attn:
+            # Lightweight attention-like gate over the per-step update.
+            # Features: [global_step_norm, t_norm, log||u||, log||g||, step_theta, step_r].
+            self.step_attn_feat_dim = 6
+            hid = int(step_attn_hidden)
+            self.step_attn_mlp = nn.Sequential(
+                nn.Linear(self.step_attn_feat_dim, hid),
+                nn.SiLU(),
+                nn.Linear(hid, 2),
+            )
+            # Identity init: delta=0 => gate=1.
+            nn.init.zeros_(self.step_attn_mlp[-1].weight)
+            nn.init.zeros_(self.step_attn_mlp[-1].bias)
 
         self.init_alpha = float(init_alpha)
         self.init_lambda = float(init_lambda)
@@ -330,6 +358,11 @@ class Refiner(nn.Module):
         pscale_clamp_hits = None
         pscale_clamp_total = 0.0
         pscale_reg_sum = None
+        step_attn_sum = None
+        step_attn_sumsq = None
+        step_attn_count = 0
+        step_attn_clamp_hits = None
+        step_attn_clamp_total = 0.0
         nonfinite_g_ratio = []
         fallback_alpha = []
         fallback_lambda = []
@@ -412,6 +445,61 @@ class Refiner(nn.Module):
                     # Avoid in-place update (needed when mul is learnable).
                     step_u_r = step_u[:, 1] * scale_final
                     step_u = torch.stack([step_u[:, 0], step_u_r], dim=-1)
+
+                if self.use_step_attn:
+                    # Attention-like per-sample gate on update vector (stability-biased range).
+                    B = int(u.shape[0])
+                    step_norm = float(pscale_step_norm)
+                    step_norm = max(0.0, min(1.0, step_norm))
+                    t_norm = float(t) / float(max(steps - 1, 1))
+
+                    u_feat_src = u.detach() if self.step_attn_detach_feat else u
+                    g_feat_src = g.detach() if self.step_attn_detach_feat else g
+                    step_feat_src = step_u.detach() if self.step_attn_detach_feat else step_u
+                    u_norm = torch.log1p(
+                        torch.linalg.vector_norm(u_feat_src.to(torch.float32), ord=2, dim=-1)
+                    ).clamp(0.0, 10.0)
+                    g_norm = torch.log1p(
+                        torch.linalg.vector_norm(g_feat_src.to(torch.float32), ord=2, dim=-1)
+                    ).clamp(0.0, 10.0)
+                    x = torch.stack(
+                        [
+                            torch.full((B,), step_norm, device=u.device, dtype=torch.float32),
+                            torch.full((B,), t_norm, device=u.device, dtype=torch.float32),
+                            u_norm,
+                            g_norm,
+                            step_feat_src[:, 0].to(torch.float32),
+                            step_feat_src[:, 1].to(torch.float32),
+                        ],
+                        dim=-1,
+                    )
+                    delta = torch.tanh(self.step_attn_mlp(x.to(u.dtype))) * float(self.step_attn_amp)
+                    gate_raw = 1.0 + delta
+                    gate_min = torch.tensor(
+                        [self.step_attn_min_theta, self.step_attn_min_r],
+                        device=gate_raw.device,
+                        dtype=gate_raw.dtype,
+                    ).view(1, 2)
+                    gate_max = torch.tensor(
+                        [self.step_attn_max_theta, self.step_attn_max_r],
+                        device=gate_raw.device,
+                        dtype=gate_raw.dtype,
+                    ).view(1, 2)
+                    gate = torch.max(torch.min(gate_raw, gate_max), gate_min)
+                    step_u = step_u * gate
+
+                    with torch.no_grad():
+                        if step_attn_sum is None:
+                            step_attn_sum = torch.zeros((2,), device=gate.device, dtype=torch.float32)
+                            step_attn_sumsq = torch.zeros((2,), device=gate.device, dtype=torch.float32)
+                            step_attn_clamp_hits = torch.zeros((2,), device=gate.device, dtype=torch.float32)
+                        g_det = gate.detach().to(torch.float32)
+                        step_attn_sum += g_det.sum(dim=0)
+                        step_attn_sumsq += (g_det * g_det).sum(dim=0)
+                        step_attn_count += int(g_det.shape[0])
+                        hit = (gate.detach() != gate_raw.detach()).to(torch.float32)
+                        step_attn_clamp_hits += hit.sum(dim=0)
+                        step_attn_clamp_total += float(hit.shape[0])
 
                 if self.use_pscale:
                     # Build pscale features according to tokens (each token contributes 1 scalar per sample).
@@ -612,6 +700,13 @@ class Refiner(nn.Module):
         if self.accept_reject and len(ar_accept_ratio) > 0:
             debug["ar_accept_ratio"] = torch.stack(ar_accept_ratio).mean()
             debug["ar_scale_mean"] = torch.stack(ar_scale_mean).mean()
+        if self.use_step_attn and step_attn_sum is not None:
+            mean = step_attn_sum / max(float(step_attn_count), 1.0)
+            var = step_attn_sumsq / max(float(step_attn_count), 1.0) - mean * mean
+            std = torch.sqrt(var.clamp_min(0.0))
+            debug["step_attn_gate_mean"] = mean
+            debug["step_attn_gate_std"] = std
+            debug["step_attn_clamp_hit_ratio"] = step_attn_clamp_hits / max(float(step_attn_clamp_total), 1.0)
 
         if not return_trace:
             return theta_T, r_T, debug

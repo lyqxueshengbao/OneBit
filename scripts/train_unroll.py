@@ -155,6 +155,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pscale_min_r", type=float, default=0.7)
     p.add_argument("--pscale_max_r", type=float, default=1.3)
     p.add_argument("--pscale_reg_w", type=float, default=1e-3)
+    # Lightweight attention-like gate on each unroll update.
+    p.add_argument("--use_step_attn", type=int, default=0, choices=[0, 1])
+    p.add_argument("--step_attn_hidden", type=int, default=32)
+    p.add_argument("--step_attn_detach_feat", type=int, default=1, choices=[0, 1])
+    p.add_argument("--step_attn_amp", type=float, default=0.3)
+    p.add_argument("--step_attn_min_theta", type=float, default=0.8)
+    p.add_argument("--step_attn_max_theta", type=float, default=1.2)
+    p.add_argument("--step_attn_min_r", type=float, default=0.8)
+    p.add_argument("--step_attn_max_r", type=float, default=1.2)
     # Monotone accept-reject / backtracking for each unroll step.
     p.add_argument("--accept_reject", type=int, default=0, choices=[0, 1])
     p.add_argument("--ar_backtrack_max", type=int, default=0)
@@ -476,6 +485,14 @@ def main() -> None:
         pscale_max_theta=float(args.pscale_max_theta),
         pscale_min_r=float(args.pscale_min_r),
         pscale_max_r=float(args.pscale_max_r),
+        use_step_attn=bool(int(args.use_step_attn)),
+        step_attn_hidden=int(args.step_attn_hidden),
+        step_attn_detach_feat=bool(int(args.step_attn_detach_feat)),
+        step_attn_amp=float(args.step_attn_amp),
+        step_attn_min_theta=float(args.step_attn_min_theta),
+        step_attn_max_theta=float(args.step_attn_max_theta),
+        step_attn_min_r=float(args.step_attn_min_r),
+        step_attn_max_r=float(args.step_attn_max_r),
         accept_reject=bool(int(args.accept_reject)),
         ar_backtrack_max=int(args.ar_backtrack_max),
         ar_backtrack_factor=float(args.ar_backtrack_factor),
@@ -956,6 +973,23 @@ def main() -> None:
                     {
                         "ar_accept_ratio": float(dbg["ar_accept_ratio"].detach().cpu().item()),
                         "ar_scale_mean": float(dbg["ar_scale_mean"].detach().cpu().item()),
+                    }
+                )
+            if "step_attn_gate_mean" in dbg:
+                gm = dbg["step_attn_gate_mean"].detach().cpu().to(torch.float32)
+                gs = dbg["step_attn_gate_std"].detach().cpu().to(torch.float32)
+                row.update(
+                    {
+                        "step_attn_mean_theta": float(gm[0].item()),
+                        "step_attn_mean_r": float(gm[1].item()),
+                        "step_attn_std_theta": float(gs[0].item()),
+                        "step_attn_std_r": float(gs[1].item()),
+                        "step_attn_clamp_hit_ratio_theta": float(
+                            dbg["step_attn_clamp_hit_ratio"][0].detach().cpu().item()
+                        ),
+                        "step_attn_clamp_hit_ratio_r": float(
+                            dbg["step_attn_clamp_hit_ratio"][1].detach().cpu().item()
+                        ),
                     }
                 )
             logger.log(row)
